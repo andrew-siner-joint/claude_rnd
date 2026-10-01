@@ -1,0 +1,11 @@
+# BlinkFlare menu registration. Runs automatically when this folder is on the
+# Nuke plugin path (see README).
+import nuke
+
+_draw = nuke.menu("Nodes").addMenu("Draw")
+_menu = _draw.addMenu("BlinkFlare")
+_menu.addCommand("BlinkFlare", "import blinkflare; blinkflare.create()")
+_menu.addCommand(
+    "Save ToolSet",
+    "import blinkflare, nuke; nuke.message('Saved ' + blinkflare.save_toolset())",
+)

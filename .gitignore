@@ -1,0 +1,3 @@
+__pycache__/
+*.pyc
+BlinkFlare/tests/harness/build/
