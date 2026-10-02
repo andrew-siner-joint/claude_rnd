@@ -78,15 +78,12 @@ float sqrt(float);
 float exp(float);
 float pow(float, float);
 float floor(float);
-float abs(float);
-int abs(int);
 
+// Float-only on purpose: the kernel uses its own abs and integer clamp
+// because those overloads aren't dependable across Blink versions.
 inline float min(float a, float b) { return a < b ? a : b; }
 inline float max(float a, float b) { return a > b ? a : b; }
-inline int min(int a, int b) { return a < b ? a : b; }
-inline int max(int a, int b) { return a > b ? a : b; }
 inline float clamp(float x, float lo, float hi) { return min(max(x, lo), hi); }
-inline int clamp(int x, int lo, int hi) { return min(max(x, lo), hi); }
 
 inline float dot(float2 a, float2 b) { return a.x * b.x + a.y * b.y; }
 inline float dot(float3 a, float3 b) { return a.x * b.x + a.y * b.y + a.z * b.z; }
@@ -120,8 +117,8 @@ struct Image {
       if (Edge == eEdgeConstant || data.pixels == nullptr) {
         return float4();
       }
-      x = clamp(x, 0, data.width - 1);
-      y = clamp(y, 0, data.height - 1);
+      x = x < 0 ? 0 : (x >= data.width ? data.width - 1 : x);
+      y = y < 0 ? 0 : (y >= data.height ? data.height - 1 : y);
     }
     return data.pixels[y * data.width + x];
   }

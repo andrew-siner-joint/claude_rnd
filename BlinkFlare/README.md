@@ -142,24 +142,52 @@ alone. Applying a preset can be undone.
 
 ## Install
 
-Requires Nuke 13 or later (Python 3).
+Requires NukeX or Nuke Studio 13 or later (Python 3) to build the node.
+
+### Easiest: the installer script
 
 1. Copy the `BlinkFlare` folder somewhere permanent.
-2. Add it to the plugin path in `~/.nuke/init.py` (or your studio's init):
+2. In Nuke's Script Editor, click **Source a script** and pick
+   `BlinkFlare/install_blinkflare.py`. Or paste the file's contents into the
+   Script Editor and run it.
+3. If it can't tell where it lives, it asks: pick the `BlinkFlare` folder or
+   `blinkflare/kernel/BlinkFlare.blink`.
 
-   ```python
-   nuke.pluginAddPath("/path/to/BlinkFlare")
-   ```
+It checks that this Nuke can compile Blink kernels from Python, compiles
+BlinkFlare and builds a test node. It also offers to add BlinkFlare to
+`~/.nuke/init.py` and puts the menu in place for the current session. A
+report is printed, saved to `~/.nuke/blinkflare_report.txt` and copied to the
+clipboard. If the kernel is rejected, the report says which kernel function
+Nuke rejected, so send it back. Once installed, the same check is under
+**Nodes > Draw > BlinkFlare > Check Install...**.
 
-3. Restart Nuke. The node is under **Nodes > Draw > BlinkFlare**, or press Tab
-   and type `BlinkFlare`.
+### By hand
 
-Creating the node compiles the Blink kernel, which needs **NukeX or Nuke
-Studio**. For seats that can't compile kernels, a NukeX user runs **Draw >
-BlinkFlare > Save ToolSet**. That writes a ready-built node with the compiled
-kernel to `~/.nuke/ToolSets/BlinkFlare.nk`, which you can share like any
-ToolSet. Saved scripts render without the package. Only the buttons (presets,
-bake, building element layers) need it.
+Add the folder to the plugin path in `~/.nuke/init.py` (or your studio's
+init) and restart Nuke:
+
+```python
+nuke.pluginAddPath("/path/to/BlinkFlare")
+```
+
+The node is under **Nodes > Draw > BlinkFlare**, or press Tab and type
+`BlinkFlare`.
+
+### Troubleshooting
+
+| Message | Meaning |
+|---|---|
+| *"BlinkFlare's Blink kernel did not compile..."* | Nuke didn't produce the kernel's parameter knobs. Run **Check Install...** for the reason (licence, a rejected kernel function, or a Nuke version that compiles differently). |
+| *"Nuke has a different BlinkFlare copy loaded"* (in the report) | An older copy is on the plugin path. Remove or update that `pluginAddPath` line. |
+| No BlinkFlare menu | `init.py` doesn't reach the folder, or Nuke wasn't restarted. Check Install fixes the menu for the current session. |
+
+### Sharing with plain-Nuke seats
+
+Compiling the kernel needs NukeX or Nuke Studio. A NukeX user runs **Draw >
+BlinkFlare > Save ToolSet**, which writes a ready-built node with the compiled
+kernel to `~/.nuke/ToolSets/BlinkFlare.nk`; share it like any ToolSet. Saved
+scripts render without the package. Only the buttons (presets, bake, building
+element layers) need it.
 
 ## Performance
 
@@ -184,6 +212,7 @@ been measured yet.
 
 ```
 BlinkFlare/
+  install_blinkflare.py      installer + diagnostic, run from the Script Editor
   menu.py, init.py           Nuke startup files (menu entries)
   blinkflare/
     kernel/BlinkFlare.blink  the BlinkScript kernel (all rendering)
@@ -215,7 +244,7 @@ Nuke isn't needed to run the tests:
 
 ```sh
 pip install numpy pillow
-python3 -m unittest discover -s tests          # 84 tests
+python3 -m unittest discover -s tests          # 101 tests
 python3 tests/harness/preview.py --preset "Sci-Fi Hoop" --out flare.png
 python3 tests/harness/preview.py --set ghost_count=30 --set ghost_blades=5 --out flare.png
 cd tests/harness && python3 preview.py --docs ../../docs/previews   # README images
@@ -250,8 +279,8 @@ assumptions need a first run in NukeX before production use:
   group, for the camera link and the mask.
 - **Proxy mode** hasn't been checked.
 
-If something fails on first build, the error from `blinkflare.create()` in the
-Script Editor is the thing to send back.
+If something fails on first build, run **Check Install...** (or
+`install_blinkflare.py`) and send back the report it saves.
 
 ## Roadmap
 

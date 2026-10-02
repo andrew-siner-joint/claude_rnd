@@ -9,3 +9,4 @@ _menu.addCommand(
     "Save ToolSet",
     "import blinkflare, nuke; nuke.message('Saved ' + blinkflare.save_toolset())",
 )
+_menu.addCommand("Check Install...", "import blinkflare; blinkflare.diagnose()")

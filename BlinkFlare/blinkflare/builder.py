@@ -17,6 +17,7 @@ first time it is switched on.
 """
 
 import os
+import tempfile
 
 import nuke
 
@@ -39,30 +40,107 @@ def kernel_source():
 
 # --------------------------------------------------------------------- kernel
 
+def param_knob_name(blink, param):
+    """Name of the BlinkScript knob for kernel parameter ``param``, or None.
+
+    Nuke names them <Kernel>_<param>; plain and case-insensitive matches are
+    accepted too in case a version differs.
+    """
+    knobs = blink.knobs()
+    for name in ("%s_%s" % (spec.KERNEL_NAME, param), param):
+        if name in knobs:
+            return name
+    low = param.lower()
+    for name in sorted(knobs):
+        if name.lower() == low or name.lower().endswith("_" + low):
+            return name
+    return None
+
+
 def param_knob(blink, param):
     """The BlinkScript knob for kernel parameter ``param``."""
-    knob = blink.knob("%s_%s" % (spec.KERNEL_NAME, param))
-    if knob is None:
-        # Fall back in case a Nuke version prefixes param knobs differently.
-        suffix = "_" + param
-        for name, k in blink.knobs().items():
-            if name.endswith(suffix):
-                return k
-        raise BuildError("BlinkScript node has no knob for kernel param '%s'. "
-                         "Did the kernel compile?" % param)
-    return knob
+    name = param_knob_name(blink, param)
+    if name is None:
+        raise BuildError("BlinkScript node %s has no knob for kernel param '%s'."
+                         % (blink.name(), param))
+    return blink[name]
 
 
-def compile_kernel(blink):
-    blink["kernelSource"].setValue(kernel_source())
-    try:
+def _process_events():
+    """Let Nuke run deferred UI work (some versions compile asynchronously)."""
+    for module in ("PySide6", "PySide2"):
+        try:
+            widgets = __import__(module + ".QtWidgets", fromlist=["QtWidgets"])
+        except ImportError:
+            continue
+        app = widgets.QApplication.instance()
+        if app is not None:
+            app.processEvents()
+        return
+
+
+def _compile_steps(blink, source):
+    """Ways of making a BlinkScript node compile from Python, in the order
+    tried. Which one takes effect synchronously differs between versions."""
+    def recompile():
         blink["recompile"].execute()
-    except Exception as e:  # Nuke raises plain RuntimeError here
-        raise BuildError(
-            "Could not compile the BlinkFlare kernel (%s).\n\n"
-            "Compiling Blink kernels needs NukeX or Nuke Studio. A NukeX user can "
-            "run Nodes > Draw > BlinkFlare > Save ToolSet and share the .nk." % e)
-    param_knob(blink, "lightPos")  # raises if params didn't appear
+
+    def validate():
+        blink.forceValidate()
+
+    def from_file():
+        path = os.path.join(tempfile.gettempdir(), "BlinkFlare_%d.blink" % os.getpid())
+        with open(path, "w") as f:
+            f.write(source)
+        blink["kernelSourceFile"].setValue(path)
+        blink["reloadKernelSourceFile"].execute()
+        blink["recompile"].execute()
+
+    return [("recompile", recompile), ("validate", validate), ("events", _process_events),
+            ("file", from_file)]
+
+
+def compile_kernel(blink, source=None, probe="lightPos"):
+    """Compile ``source`` (default: BlinkFlare) on ``blink``. Returns the step
+    that worked; raises BuildError explaining what happened otherwise."""
+    if source is None:
+        source = kernel_source()
+    blink["kernelSource"].setValue(source)
+    errors = []
+    for name, step in _compile_steps(blink, source):
+        try:
+            step()
+        except Exception as e:  # Nuke raises plain RuntimeError from knob scripts
+            errors.append("%s: %s" % (name, e))
+        if param_knob_name(blink, probe) is not None:
+            if name == "file" and blink.knob("kernelSourceFile") is not None:
+                blink["kernelSourceFile"].setValue("")
+            return name
+    raise BuildError(compile_failure_message(blink, probe, errors))
+
+
+def compile_failure_message(blink, probe, errors=()):
+    def flag(key):
+        try:
+            return nuke.env[key]
+        except Exception:
+            return None
+    version = getattr(nuke, "NUKE_VERSION_STRING", "?")
+    if flag("nukex") or flag("studio"):
+        licence = "NukeX/Studio"
+    else:
+        licence = "not NukeX - compiling Blink kernels needs NukeX or Nuke Studio"
+    has_error = blink.hasError() if hasattr(blink, "hasError") else "?"
+    lines = [
+        "BlinkFlare's Blink kernel did not compile: the BlinkScript node has no "
+        "knob for its '%s' parameter." % probe,
+        "Nuke %s (%s). BlinkScript node in error: %s." % (version, licence, has_error),
+    ]
+    if errors:
+        lines.append("Compile attempts raised: " + "; ".join(errors))
+    lines.append("For a full diagnosis run Nodes > Draw > BlinkFlare > Check Install... "
+                 "(or install_blinkflare.py from the Script Editor) and send the report it saves.")
+    return "\n".join(lines)
 
 
 def link_kernel_params(blink):

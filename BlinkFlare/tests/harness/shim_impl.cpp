@@ -17,8 +17,6 @@ float sqrt(float x) { return std::sqrt(x); }
 float exp(float x) { return std::exp(x); }
 float pow(float x, float y) { return std::pow(x, y); }
 float floor(float x) { return std::floor(x); }
-float abs(float x) { return std::fabs(x); }
-int abs(int x) { return std::abs(x); }
 
 int2& currentPos() {
   thread_local int2 pos;

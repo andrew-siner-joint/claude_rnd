@@ -46,6 +46,14 @@ def build_element_layers(node):
     builder.build_element_layers(node)
 
 
+def diagnose():
+    """Run install_blinkflare.py: checks the install, writes a report."""
+    import os
+    import runpy
+    root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    runpy.run_path(os.path.join(root, "install_blinkflare.py"), run_name="__main__")
+
+
 def save_toolset(path=None):
     """Save a ready-built BlinkFlare as a ToolSet .nk (for non-NukeX seats)."""
     from blinkflare import builder

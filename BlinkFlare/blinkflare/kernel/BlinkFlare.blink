@@ -274,6 +274,18 @@ kernel BlinkFlareKernel : ImageComputationKernel<ePixelWise>
 
   // ------------------------------------------------------------------ helpers
 
+  // Own abs and integer clamp/max: Blink's built-in overloads for these vary
+  // between Nuke versions, so the kernel avoids relying on them.
+  float lfAbs(float x)
+  {
+    return x < 0.0f ? -x : x;
+  }
+
+  int lfClampi(int x, int lo, int hi)
+  {
+    return x < lo ? lo : (x > hi ? hi : x);
+  }
+
   float lfFract(float x)
   {
     return x - floor(x);
@@ -294,7 +306,7 @@ kernel BlinkFlareKernel : ImageComputationKernel<ePixelWise>
     return t * t * (3.0f - 2.0f * t);
   }
 
-  // Wrap an angle to [-pi, pi).
+  // Wrap an angle into -pi..pi.
   float lfWrapPi(float a)
   {
     return a - 6.28318531f * floor(a / 6.28318531f + 0.5f);
@@ -319,9 +331,9 @@ kernel BlinkFlareKernel : ImageComputationKernel<ePixelWise>
   float3 lfHue(float h)
   {
     float x = lfFract(h) * 6.0f;
-    float r = clamp(abs(x - 3.0f) - 1.0f, 0.0f, 1.0f);
-    float g = clamp(2.0f - abs(x - 2.0f), 0.0f, 1.0f);
-    float b = clamp(2.0f - abs(x - 4.0f), 0.0f, 1.0f);
+    float r = clamp(lfAbs(x - 3.0f) - 1.0f, 0.0f, 1.0f);
+    float g = clamp(2.0f - lfAbs(x - 2.0f), 0.0f, 1.0f);
+    float b = clamp(2.0f - lfAbs(x - 4.0f), 0.0f, 1.0f);
     return float3(r, g, b);
   }
 
@@ -362,7 +374,7 @@ kernel BlinkFlareKernel : ImageComputationKernel<ePixelWise>
       float s = seed * 17.17f + kw * 7.13f;
       float h0 = lfHash(s);
       float dTheta = (sector - (k + 0.5f + (h0 - 0.5f) * 0.8f)) * 6.28318531f / N;
-      if (abs(dTheta) < 1.5f) {
+      if (lfAbs(dTheta) < 1.5f) {
         float along = r * cos(dTheta);
         float h1 = lfHash(s + 1.71f);
         float rayLen = len * (1.0f - clamp(glintLengthRandom, 0.0f, 0.95f) * h1);
@@ -384,7 +396,7 @@ kernel BlinkFlareKernel : ImageComputationKernel<ePixelWise>
 
   float3 glintTerm(float r, float ang)
   {
-    int n = clamp(glintCount, 1, 256);
+    int n = lfClampi(glintCount, 1, 256);
     float len = max(glintLength * _S, 0.00001f);
     float width = glintWidth * 0.001f * _S;
     if (r >= len) {
@@ -392,7 +404,7 @@ kernel BlinkFlareKernel : ImageComputationKernel<ePixelWise>
     }
     float sum = rayLayer(r, ang, n, len, width, glintSeed, _glintRot);
     if (glintFine > 0.0f && r < len * 0.55f) {
-      int nf = clamp(n * 4, 8, 512);
+      int nf = lfClampi(n * 4, 8, 512);
       sum += glintFine * rayLayer(r, ang, nf, len * 0.55f, width * 0.5f, glintSeed + 41.0f, _glintRot);
     }
     return lfRGB(glintColor) * (sum * glintIntensity);
@@ -400,7 +412,7 @@ kernel BlinkFlareKernel : ImageComputationKernel<ePixelWise>
 
   float3 streakTerm(float2 d)
   {
-    int n = clamp(streakCount, 1, 16);
+    int n = lfClampi(streakCount, 1, 16);
     float len = max(streakLength * _S, 0.00001f);
     float th0 = max(streakThickness * 0.001f * _S, _invH * 0.5f);
     float sum = 0.0f;
@@ -412,12 +424,12 @@ kernel BlinkFlareKernel : ImageComputationKernel<ePixelWise>
         sa = sa * _streakStep.x + ca * _streakStep.y;
         ca = c2;
       }
-      float u = abs(d.x * ca + d.y * sa) / len;
+      float u = lfAbs(d.x * ca + d.y * sa) / len;
       if (u < 1.0f) {
         float v = d.y * ca - d.x * sa;
         float th = th0 * (1.0f - 0.6f * u);
         float core = exp(-(v * v) / (th * th));
-        float halo = streakGlow * 0.25f * exp(-abs(v) / (th * 8.0f));
+        float halo = streakGlow * 0.25f * exp(-lfAbs(v) / (th * 8.0f));
         float fall = (1.0f - u) * (1.0f - u) * (0.35f + 0.65f * exp(-u * 6.0f));
         sum += (core + halo) * fall;
       }
@@ -434,7 +446,7 @@ kernel BlinkFlareKernel : ImageComputationKernel<ePixelWise>
     float T = max(ringThickness * _S, _invH);
     float x = (r - ringRadius * _S) / T;
     float3 col = float3(0.0f, 0.0f, 0.0f);
-    if (abs(x) < 3.0f) {
+    if (lfAbs(x) < 3.0f) {
       float env = exp(-x * x * 2.0f);
       float3 spec = lfSpectrum(clamp(0.5f + 0.4f * x, 0.0f, 1.0f)) * 1.6f;
       float3 tint = lfMix3(float3(1.0f, 1.0f, 1.0f), spec, clamp(ringSpectral, 0.0f, 1.0f));
@@ -455,9 +467,9 @@ kernel BlinkFlareKernel : ImageComputationKernel<ePixelWise>
 
   float3 ghostTerm(float2 P)
   {
-    int n = clamp(ghostCount, 0, 64);
+    int n = lfClampi(ghostCount, 0, 64);
     bool poly = ghostBlades >= 3;
-    float blade = 6.28318531f / float(max(ghostBlades, 3));
+    float blade = 6.28318531f / float(lfClampi(ghostBlades, 3, 1000));
     float polyIn = cos(blade * 0.5f);
     float ca = clamp(ghostChroma, -0.5f, 0.5f);
     float3 sum = float3(0.0f, 0.0f, 0.0f);
@@ -477,7 +489,7 @@ kernel BlinkFlareKernel : ImageComputationKernel<ePixelWise>
       float2 d = P - c;
       d.x = d.x / _aspect;
       float r = length(d);
-      float reach = size * (1.0f + abs(ca) + ghostSoftness) + _invH * 2.0f;
+      float reach = size * (1.0f + lfAbs(ca) + ghostSoftness) + _invH * 2.0f;
       if (r > reach) {
         continue;
       }
@@ -509,8 +521,8 @@ kernel BlinkFlareKernel : ImageComputationKernel<ePixelWise>
   // The spectrum always runs radially, like real dispersion.
   float3 spectralTerm(float r, float ang)
   {
-    int n = clamp(spectralCount, 0, 64);
-    float N = float(max(n, 1));
+    int n = lfClampi(spectralCount, 0, 64);
+    float N = float(lfClampi(n, 1, 64));
     float len = max(spectralLength * _S, 0.00001f);
     float w = max(spectralWidth * 0.001f * _S, _invH * 0.75f);
     float beta = clamp(spectralOrient, 0.0f, 1.0f) * 1.57079633f;
@@ -525,7 +537,7 @@ kernel BlinkFlareKernel : ImageComputationKernel<ePixelWise>
       float s = spectralSeed * 11.71f + float(i) * 3.97f;
       float h1 = lfHash(s + 1.37f);
       float dr = r - (spectralOffset + spectralSpread * h1) * _S;
-      if (abs(dr) > len + w * 4.0f) {
+      if (lfAbs(dr) > len + w * 4.0f) {
         continue;
       }
       float h0 = lfHash(s);
@@ -534,12 +546,12 @@ kernel BlinkFlareKernel : ImageComputationKernel<ePixelWise>
       float L = len * (1.0f - 0.6f * rnd * h2);
       float dt = lfWrapPi(ang - a) * r;
       float reach = L + w * 4.0f;
-      if (abs(dr) > reach || abs(dt) > reach) {
+      if (lfAbs(dr) > reach || lfAbs(dt) > reach) {
         continue;
       }
       float h3 = lfHash(s + 3.89f);
       float u = (dr * cb + dt * sb) / L;
-      if (abs(u) >= 1.0f) {
+      if (lfAbs(u) >= 1.0f) {
         continue;
       }
       float v = dt * cb - dr * sb;
@@ -578,7 +590,7 @@ kernel BlinkFlareKernel : ImageComputationKernel<ePixelWise>
     _spectralRot = masterRotation * deg + spin;
     _ghostRot = (masterRotation + ghostRotation) * deg + 1.57079633f;
 
-    int ns = clamp(streakCount, 1, 16);
+    int ns = lfClampi(streakCount, 1, 16);
     _streakDir = float2(cos(_streakRot), sin(_streakRot));
     _streakStep = float2(cos(3.14159265f / float(ns)), sin(3.14159265f / float(ns)));
 
@@ -588,7 +600,7 @@ kernel BlinkFlareKernel : ImageComputationKernel<ePixelWise>
     float2 Aa = float2(_A.x / _aspect, _A.y);
     _ghostSeg0 = La + Aa * ghostSpreadMin;
     _ghostSeg1 = La + Aa * ghostSpreadMax;
-    _ghostReach = max(ghostSize * _S, _invH * 2.0f) * (1.0f + abs(clamp(ghostChroma, -0.5f, 0.5f)) + ghostSoftness) + _invH * 2.0f;
+    _ghostReach = max(ghostSize * _S, _invH * 2.0f) * (1.0f + lfAbs(clamp(ghostChroma, -0.5f, 0.5f)) + ghostSoftness) + _invH * 2.0f;
 
     // Spectral streaks live in an annulus around the light.
     float sReach = max(spectralLength * _S, 0.00001f) + max(spectralWidth * 0.001f * _S, _invH * 0.75f) * 4.0f;
@@ -619,7 +631,7 @@ kernel BlinkFlareKernel : ImageComputationKernel<ePixelWise>
     float pxPerUnit = 0.001f / _invH;
 
     if (vis > 0.0f && occlusionEnable) {
-      int ns = clamp(occlusionSamples, 1, 64);
+      int ns = lfClampi(occlusionSamples, 1, 64);
       float rad = occlusionRadius * pxPerUnit;
       float invDepth = 1.0f / max(lightDepth, 0.000001f);
       float acc = 0.0f;
@@ -664,30 +676,30 @@ kernel BlinkFlareKernel : ImageComputationKernel<ePixelWise>
       float rA = length(float2(d.x / _aspect, d.y));
       float ang = atan2(d.y, d.x);
 
-      bool all = soloElement < 1 || soloElement > 7;
+      bool showAll = soloElement < 1 || soloElement > 7;
       bool dirtSolo = soloElement == 7;
       // Dirt reacts to the other elements, so soloing it still evaluates them.
       bool forDirt = dirtSolo && dirtEnable && dirtResponse > 0.0f;
 
-      if (glowEnable && (all || forDirt || soloElement == 1)) {
+      if (glowEnable && (showAll || forDirt || soloElement == 1)) {
         col += glowTerm(rA);
       }
-      if (glintEnable && (all || forDirt || soloElement == 2)) {
+      if (glintEnable && (showAll || forDirt || soloElement == 2)) {
         col += glintTerm(r, ang);
       }
-      if (streakEnable && (all || forDirt || soloElement == 3)) {
+      if (streakEnable && (showAll || forDirt || soloElement == 3)) {
         col += streakTerm(d);
       }
-      if (ringEnable && (all || forDirt || soloElement == 4)) {
+      if (ringEnable && (showAll || forDirt || soloElement == 4)) {
         col += ringTerm(P);
       }
-      if (ghostEnable && (all || forDirt || soloElement == 5)) {
+      if (ghostEnable && (showAll || forDirt || soloElement == 5)) {
         col += ghostTerm(P);
       }
-      if (spectralEnable && (all || forDirt || soloElement == 6)) {
+      if (spectralEnable && (showAll || forDirt || soloElement == 6)) {
         col += spectralTerm(r, ang);
       }
-      if (dirtEnable && (all || dirtSolo)) {
+      if (dirtEnable && (showAll || dirtSolo)) {
         float4 dv = dirt();
         float3 dc = dirtTerm(rA, col, dv);
         if (dirtSolo) {

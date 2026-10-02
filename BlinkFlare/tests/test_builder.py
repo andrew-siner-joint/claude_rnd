@@ -140,6 +140,40 @@ class GraphTest(BuilderBase):
         finally:
             builder.compile_kernel = original
 
+    def test_compile_falls_back_when_recompile_is_deferred(self):
+        for trigger in ("validate", "file"):
+            fake_nuke.reset()
+            fake_nuke.BLINK_COMPILE_ON = {trigger}
+            group = builder.create()
+            kernel = group.child(spec.KERNEL_NODE)
+            self.assertIsNotNone(builder.param_knob_name(kernel, "lightPos"), trigger)
+            self.assertEqual(kernel["kernelSourceFile"].value(), "", trigger)
+
+    def test_unprefixed_param_knobs_are_found(self):
+        fake_nuke.reset()
+        fake_nuke.BLINK_PREFIX = ""
+        kernel = builder.create().child(spec.KERNEL_NODE)
+        self.assertEqual(builder.param_knob_name(kernel, "lightPos"), "lightPos")
+
+    def test_compile_failure_explains_itself(self):
+        fake_nuke.reset()
+        fake_nuke.BLINK_REJECT.append("lfWrapPi")
+        with self.assertRaises(builder.BuildError) as ctx:
+            builder.create()
+        msg = str(ctx.exception)
+        self.assertIn("did not compile", msg)
+        self.assertIn("in error: True", msg)
+        self.assertIn("install_blinkflare.py", msg)
+        self.assertEqual([n for n in fake_nuke.root().children() if n.Class() == "Group"], [])
+
+    def test_compile_failure_mentions_licence(self):
+        fake_nuke.reset()
+        fake_nuke.env["nukex"] = False
+        fake_nuke.BLINK_COMPILE_ON = set()
+        with self.assertRaises(builder.BuildError) as ctx:
+            builder.create()
+        self.assertIn("needs NukeX", str(ctx.exception))
+
     def test_save_toolset(self):
         path = builder.save_toolset(os.path.join(self.tmp.name, "ToolSets", "BlinkFlare.nk"))
         self.assertTrue(os.path.exists(path))

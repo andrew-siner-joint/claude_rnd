@@ -9,6 +9,13 @@ import re
 
 STARTLINE = 0x1000
 GUI = False
+NUKE_VERSION_STRING = "15.1v3 (fake)"
+env = {"nukex": True}
+
+# How the fake BlinkScript node behaves; reset() restores these.
+BLINK_COMPILE_ON = {"recompile"}  # triggers that compile: recompile, validate, file
+BLINK_REJECT = []                 # source snippets the fake "compiler" rejects
+BLINK_PREFIX = None               # param knob prefix; None = "<Kernel>_"
 
 
 class Format(object):
@@ -203,8 +210,14 @@ class PyScript_Knob(Knob):
         self.script = script
 
     def execute(self):
-        if self.node is not None and self.node.Class() == "BlinkScript" and self._name == "recompile":
-            self.node._compile()
+        if self.node is None or self.node.Class() != "BlinkScript":
+            return
+        if self._name == "recompile":
+            self.node._trigger("recompile")
+        elif self._name == "reloadKernelSourceFile":
+            with open(self.node["kernelSourceFile"].value()) as f:
+                self.node["kernelSource"].setValue(f.read())
+            self.node._trigger("file")
 
 
 class Link_Knob(Knob):
@@ -246,6 +259,8 @@ CLASS_KNOBS = {
     },
     "BlinkScript": {
         "kernelSource": String_Knob,
+        "kernelSourceFile": String_Knob,
+        "reloadKernelSourceFile": PyScript_Knob,
         "recompile": PyScript_Knob,
         "useGPUIfAvailable": Boolean_Knob,
         "vectorize": Boolean_Knob,
@@ -411,17 +426,36 @@ class Node(object):
         _context.pop()
 
     # BlinkScript
+    def forceValidate(self):
+        if self._class == "BlinkScript":
+            self._trigger("validate")
+
+    def hasError(self):
+        return getattr(self, "_error", False)
+
+    def _trigger(self, kind):
+        if kind in BLINK_COMPILE_ON:
+            self._compile()
+
     def _compile(self):
+        for name in getattr(self, "_param_knobs", []):
+            self._knobs.pop(name, None)
+        self._param_knobs = []
         src = self["kernelSource"].value()
+        self._error = any(bad in src for bad in BLINK_REJECT)
+        if self._error:
+            return  # like Nuke: no exception, the node is just in error
         kernel = re.search(r"kernel\s+(\w+)\s*:", src).group(1)
+        prefix = kernel + "_" if BLINK_PREFIX is None else BLINK_PREFIX
         types = dict((name, t) for t, name in re.findall(
             r"^\s*(float[234]?|int|bool)\s+(\w+);", src.split("param:")[1].split("local:")[0], re.M))
         widths = {"float": 1, "float2": 2, "float3": 3, "float4": 4, "int": 1, "bool": 1}
         for var, label in re.findall(r'defineParam\((\w+),\s*"(\w+)"', src):
-            knob = Knob(kernel + "_" + label)
+            knob = Knob(prefix + label)
             knob.channels = widths[types[var]]
             knob.values = [0.0] * knob.channels
             self._add(knob)
+            self._param_knobs.append(knob.name())
         self._max_inputs = len(re.findall(r"Image<eRead", src))
 
 
@@ -439,7 +473,15 @@ def root():
 
 
 def reset(fmt=None):
-    global _root, _this, _this_knob
+    global _root, _this, _this_knob, BLINK_COMPILE_ON, BLINK_PREFIX
+    BLINK_COMPILE_ON = {"recompile"}
+    BLINK_PREFIX = None
+    del BLINK_REJECT[:]
+    env.clear()
+    env["nukex"] = True
+    del filenames_queue[:]
+    del asks_queue[:]
+    _menus.clear()
     _root = None
     _this = None
     _this_knob = None
@@ -481,6 +523,63 @@ def Layer(name, channels):
 
 def getInput(prompt, default=""):
     return inputs_queue.pop(0) if inputs_queue else None
+
+
+filenames_queue = []
+asks_queue = []
+
+
+def getFilename(message, pattern=None, default=None):
+    return filenames_queue.pop(0) if filenames_queue else None
+
+
+def ask(question):
+    return asks_queue.pop(0) if asks_queue else True
+
+
+class ProgressTask(object):
+    def __init__(self, title):
+        self.messages = []
+
+    def setMessage(self, text):
+        self.messages.append(text)
+
+    def setProgress(self, pct):
+        pass
+
+    def isCancelled(self):
+        return False
+
+
+class _Menu(object):
+    def __init__(self):
+        self.items = {}
+
+    def findItem(self, path):
+        node = self
+        for part in path.split("/"):
+            node = node.items.get(part) if isinstance(node, _Menu) else None
+            if node is None:
+                return None
+        return node
+
+    def addMenu(self, name, **kw):
+        return self.items.setdefault(name, _Menu())
+
+    def addCommand(self, name, command="", *args, **kw):
+        self.items[name] = command
+        return command
+
+
+_menus = {}
+
+
+def menu(name):
+    return _menus.setdefault(name, _Menu())
+
+
+def pluginPath():
+    return []
 
 
 class _Nodes(object):
