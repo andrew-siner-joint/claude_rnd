@@ -1,7 +1,7 @@
 // Harness driver: renders BlinkFlare.blink on the CPU.
 //
 //   blinkflare_render --list-params
-//   blinkflare_render W H params.txt out.raw [--canvas f] [--occlusion f] [--dirt f]
+//   blinkflare_render W H params.txt out.raw [--src f] [--occlusion f] [--dirt f]
 //
 // params.txt: one "name v0 [v1 ...]" per line. Images are raw float32 RGBA,
 // W*H*4 floats, row 0 at the bottom.
@@ -34,17 +34,17 @@ int main(int argc, char** argv) {
     return 0;
   }
   if (argc < 5) {
-    std::fprintf(stderr, "usage: %s W H params.txt out.raw [--canvas f] [--occlusion f] [--dirt f]\n", argv[0]);
+    std::fprintf(stderr, "usage: %s W H params.txt out.raw [--src f] [--occlusion f] [--dirt f]\n", argv[0]);
     return 2;
   }
   int w = std::atoi(argv[1]);
   int h = std::atoi(argv[2]);
   size_t n = static_cast<size_t>(w) * static_cast<size_t>(h) * 4;
-  std::vector<float> canvas(n, 0.0f), occlusion(n, 0.0f), dirt(n, 0.0f), out(n, 0.0f);
+  std::vector<float> src(n, 0.0f), occlusion(n, 0.0f), dirt(n, 0.0f), out(n, 0.0f);
 
   for (int i = 5; i + 1 < argc; i += 2) {
     std::string flag = argv[i];
-    std::vector<float>* target = flag == "--canvas" ? &canvas
+    std::vector<float>* target = flag == "--src" ? &src
                                : flag == "--occlusion" ? &occlusion
                                : flag == "--dirt" ? &dirt : nullptr;
     if (!target || !loadRaw(argv[i + 1], *target)) {
@@ -53,7 +53,7 @@ int main(int argc, char** argv) {
     }
   }
 
-  bf_create(BfImage{canvas.data(), w, h}, BfImage{occlusion.data(), w, h},
+  bf_create(BfImage{src.data(), w, h}, BfImage{occlusion.data(), w, h},
             BfImage{dirt.data(), w, h}, BfImage{out.data(), w, h});
 
   std::ifstream pf(argv[3]);

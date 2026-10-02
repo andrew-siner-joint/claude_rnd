@@ -16,7 +16,7 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.abspath(os.path.join(HERE, "..", ".."))
 sys.path.insert(0, ROOT)
 
-from blinkflare import spec, presets  # noqa: E402
+from blinkflare import camera, spec, presets  # noqa: E402
 
 BINARY = os.path.join(HERE, "build", "blinkflare_render")
 
@@ -74,9 +74,9 @@ def look_values(preset="Default", overrides=None, w=960, h=540):
     return values
 
 
-def render_flare(values, w, h, occlusion=None, dirt=None, verbose=False):
+def render_flare(values, w, h, src=None, occlusion=None, dirt=None, scene=None, verbose=False):
     """Return the kernel output (flare only) as float32 HxWx4, row 0 bottom."""
-    params = spec.resolve_params(values, w, h)
+    params = spec.resolve_params(values, w, h, scene)
     with tempfile.TemporaryDirectory() as tmp:
         pfile = os.path.join(tmp, "params.txt")
         with open(pfile, "w") as f:
@@ -85,7 +85,7 @@ def render_flare(values, w, h, occlusion=None, dirt=None, verbose=False):
                 f.write("%s %s\n" % (name, " ".join(repr(float(x)) for x in vals)))
         out = os.path.join(tmp, "out.raw")
         cmd = [BINARY, str(w), str(h), pfile, out]
-        for flag, img in (("--occlusion", occlusion), ("--dirt", dirt)):
+        for flag, img in (("--src", src), ("--occlusion", occlusion), ("--dirt", dirt)):
             if img is not None:
                 path = os.path.join(tmp, flag.strip("-") + ".raw")
                 np.ascontiguousarray(img, np.float32).tofile(path)
@@ -106,8 +106,10 @@ def to_display(rgba):
 
 
 def render_png(values, w, h, path=None, background=True, **inputs):
+    bg = plate(w, h) if background else None
+    inputs.setdefault("src", bg)
     flare = render_flare(values, w, h, verbose=True, **inputs)
-    comp = flare + plate(w, h) if background else flare
+    comp = flare + inputs["src"] if inputs["src"] is not None else flare
     img = to_display(comp)
     if path:
         img.save(path)
@@ -177,11 +179,29 @@ def articulation_gif(path, w=480, h=270, frames=36, preset="Default"):
     images[0].save(path, save_all=True, append_images=images[1:], duration=60, loop=0)
 
 
+def camera_gif(path, w=480, h=270, frames=40):
+    """A camera panning past a light fixed in world space (3D mode)."""
+    images = []
+    light = (-30.0, 12.0, -100.0)
+    for f in range(frames):
+        t = f / (frames - 1.0)
+        scene = {
+            "world_matrix": camera.matrix_trs((0, 2, 0), (4 - 6 * t, 40 - 55 * t, 0)),
+            "light_world": light, "focal": 35.0, "haperture": 36.0,
+        }
+        values = look_values("Default", {"light_source": 1, "articulation_mode": 2}, w, h)
+        img = render_png(values, w, h, scene=scene).convert("RGB")
+        _label(ImageDraw.Draw(img), 0, 0, "3D: camera pan, light at a fixed world position")
+        images.append(img)
+    images[0].save(path, save_all=True, append_images=images[1:], duration=70, loop=0)
+
+
 def docs(folder):
     os.makedirs(folder, exist_ok=True)
     contact_sheet(os.path.join(folder, "presets.png"))
     element_sheet(os.path.join(folder, "elements.png"))
     articulation_gif(os.path.join(folder, "articulation.gif"))
+    camera_gif(os.path.join(folder, "camera.gif"))
 
 
 def main():

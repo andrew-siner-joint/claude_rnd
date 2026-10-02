@@ -1,11 +1,14 @@
 """Consistency between the kernel, the knob spec and the presets."""
+import json
+import os
 import re
+import tempfile
 import unittest
 
 import kernel_parse
 from blinkflare import presets, spec
 
-KIND_FOR_TYPE = {"float": ("double", "int"), "int": ("int",), "bool": ("bool",),
+KIND_FOR_TYPE = {"float": ("double", "int"), "int": ("int", "enum"), "bool": ("bool",),
                  "float2": ("xy",), "float4": ("color",)}
 
 
@@ -107,6 +110,49 @@ class Presets(unittest.TestCase):
 
     def test_preset_menu_lists_presets(self):
         self.assertEqual(spec.enum_items(spec.knob("preset")), list(presets.PRESETS))
+
+
+class SavedPresets(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.env = dict(os.environ)
+        self.studio = os.path.join(self.tmp.name, "studio")
+        self.show = os.path.join(self.tmp.name, "show")
+        self.personal = os.path.join(self.tmp.name, "personal")
+        os.environ["BLINKFLARE_PRESET_PATH"] = os.pathsep.join([self.show, self.studio])
+        os.environ["BLINKFLARE_PRESET_SAVE_DIR"] = self.personal
+
+    def tearDown(self):
+        os.environ.clear()
+        os.environ.update(self.env)
+        self.tmp.cleanup()
+
+    def write(self, folder, fname, data):
+        os.makedirs(folder, exist_ok=True)
+        with open(os.path.join(folder, fname), "w") as f:
+            f.write(data if isinstance(data, str) else json.dumps(data))
+
+    def test_earlier_folders_win_and_personal_is_last(self):
+        self.write(self.studio, "a.json", {"name": "Look", "knobs": {"ghost_count": 1}})
+        self.write(self.show, "b.json", {"name": "Look", "knobs": {"ghost_count": 2}})
+        presets.write_preset("Look", {"ghost_count": 3})
+        self.assertEqual(presets.all_presets()["Look"], {"ghost_count": 2})
+        self.assertEqual(presets.preset_dirs(), [self.show, self.studio, self.personal])
+
+    def test_bad_files_and_knobs_are_skipped(self):
+        self.write(self.studio, "broken.json", "{not json")
+        self.write(self.studio, "noname.json", {"knobs": {}})
+        self.write(self.studio, "ok.json", {"name": "Ok", "knobs": {
+            "ghost_count": 4.0, "glow_color": [1, 0, 0], "light_pos": [1, 2], "bogus": 1}})
+        found = presets.saved_presets()
+        self.assertEqual(list(found), ["Ok"])
+        self.assertEqual(found["Ok"], {"ghost_count": 4, "glow_color": (1.0, 0.0, 0.0)})
+
+    def test_builtin_names_cannot_be_shadowed(self):
+        self.write(self.studio, "d.json", {"name": "Default", "knobs": {"ghost_count": 1}})
+        self.assertEqual(presets.all_presets()["Default"], {})
+        with self.assertRaises(ValueError):
+            presets.write_preset("Default", {})
 
 
 if __name__ == "__main__":

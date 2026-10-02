@@ -43,6 +43,7 @@ class Knob(object):
         self.animated = False
         self.link = None
         self.node = None
+        self.keys = {}  # channel -> {frame: value}
 
     def name(self):
         return self._name
@@ -66,7 +67,28 @@ class Knob(object):
     def value(self, channel=0):
         return self.values[channel] if self.channels > 1 else self.values[0]
 
+    def getValue(self, channel=0):
+        return self.value(channel)
+
+    def getValueAt(self, frame, channel=0):
+        return self.value(channel)
+
+    def setAnimated(self, channel=-1):
+        self.animated = True
+
+    def setValueAt(self, value, frame, channel=0):
+        self._check(channel)
+        self.animated = True
+        self.keys.setdefault(channel, {})[frame] = value
+
+    def animation(self, channel):
+        if channel not in self.expressions and channel not in self.keys:
+            return None
+        expr = self.expressions.get(channel, "curve")
+        return type("AnimationCurve", (), {"expression": lambda _self: expr})()
+
     def setExpression(self, expr, channel=-1):
+        self.set_count = getattr(self, "set_count", 0) + 1
         if channel == -1:
             for c in range(self.channels):
                 self.expressions[c] = expr
@@ -88,10 +110,15 @@ class Knob(object):
         self.range = (lo, hi)
 
     def isAnimated(self):
-        return self.animated
+        return self.animated or bool(self.expressions) or bool(self.keys)
+
+    def hasExpression(self, channel=-1):
+        return bool(self.expressions) if channel == -1 else channel in self.expressions
 
     def clearAnimated(self):
         self.animated = False
+        self.expressions = {}
+        self.keys = {}
 
 
 class Double_Knob(Knob):
@@ -116,6 +143,14 @@ class AColor_Knob(Knob):
 
 class XY_Knob(Knob):
     channels = 2
+
+
+class XYZ_Knob(Knob):
+    channels = 3
+
+
+class Matrix_Knob(Knob):
+    channels = 16
 
 
 class BBox_Knob(Knob):
@@ -154,6 +189,13 @@ class Enumeration_Knob(Knob):
     def value(self, channel=0):
         return self.items[self.values[0]]
 
+    def getValue(self, channel=0):
+        return float(self.values[0])
+
+    def setValues(self, items):
+        self.items = list(items)
+        self.values = [min(self.values[0], len(self.items) - 1)]
+
 
 class PyScript_Knob(Knob):
     def __init__(self, name, label="", script=""):
@@ -174,12 +216,27 @@ class Link_Knob(Knob):
 
 MERGE_OPS = ["over", "plus", "screen", "max", "multiply"]
 
+
+def _enum(items):
+    return lambda n: Enumeration_Knob(n, "", items)
+
+
+AXIS_KNOBS = {"translate": XYZ_Knob, "rotate": XYZ_Knob, "world_matrix": Matrix_Knob}
+
 CLASS_KNOBS = {
-    "Group": {"tile_color": Int_Knob},
+    "Group": {"tile_color": Int_Knob, "knobChanged": String_Knob},
+    "Dot": {},
+    "NoOp": {},
+    "Axis2": AXIS_KNOBS,
+    "Camera2": dict(AXIS_KNOBS, focal=Double_Knob, haperture=Double_Knob, winroll=Double_Knob,
+                    win_translate=XY_Knob, win_scale=XY_Knob),
+    "TimeBlur": {"divisions": Int_Knob, "shutter": Double_Knob,
+                 "shutteroffset": _enum(["centred", "start", "end", "custom"])},
+    "Copy": dict(("%s%d" % (d, i), String_Knob) for d in ("from", "to") for i in range(4)),
     "Input": {"number": Int_Knob},
     "Output": {},
     "Multiply": {"channels": String_Knob, "value": Double_Knob},
-    "AddChannels": {"channels": String_Knob},
+    "AddChannels": {"channels": String_Knob, "channels2": String_Knob},
     "Crop": {"box": BBox_Knob, "reformat": Boolean_Knob, "crop": Boolean_Knob},
     "Reformat": {
         "type": lambda n: Enumeration_Knob(n, "", ["to format", "to box", "scale"]),
@@ -194,17 +251,24 @@ CLASS_KNOBS = {
         "vectorize": Boolean_Knob,
     },
     "Merge2": {"operation": lambda n: Enumeration_Knob(n, "", MERGE_OPS),
-               "output": String_Knob, "mix": Double_Knob},
+               "output": String_Knob, "mix": Double_Knob, "invert_mask": Boolean_Knob,
+               "maskChannelMask": String_Knob},
     "Switch": {"which": Double_Knob},
     "Root": {},
 }
 MAX_INPUTS = {"Input": 0, "Output": 1, "Multiply": 1, "AddChannels": 1, "Crop": 1,
-              "Reformat": 1, "BlinkScript": 1, "Merge2": 10, "Switch": 10, "Root": 0}
+              "Reformat": 1, "BlinkScript": 1, "Merge2": 10, "Switch": 10, "Root": 0,
+              "Dot": 1, "NoOp": 1, "Axis2": 1, "Camera2": 1, "TimeBlur": 1, "Copy": 2}
+NO_DISABLE = ("Root", "Input", "Output", "Group")
 
 _root = None
 _context = []
 _selected = []
 _this = None
+_this_knob = None
+_layers = ["rgba", "depth"]
+inputs_queue = []
+messages = []
 
 
 class Node(object):
@@ -223,6 +287,8 @@ class Node(object):
         self._format = None
         for kname, factory in CLASS_KNOBS[cls].items():
             self._add(factory(kname))
+        if cls not in NO_DISABLE:
+            self._add(Boolean_Knob("disable"))
         if parent is not None:
             parent._children.append(self)
             self.setName(cls + "1")
@@ -262,6 +328,17 @@ class Node(object):
     def name(self):
         return self._name
 
+    def fullName(self):
+        parts = []
+        node = self
+        while node is not None and node._parent is not None:
+            parts.append(node._name)
+            node = node._parent
+        return ".".join(reversed(parts))
+
+    def node(self, name):
+        return self.child(name)
+
     def setName(self, name, uncollide=True):
         siblings = set(n._name for n in self._parent._children if n is not self)
         if name in siblings:
@@ -278,6 +355,9 @@ class Node(object):
         return self._max_inputs
 
     def setInput(self, i, node):
+        if node is None:
+            self._inputs.pop(i, None)
+            return True
         if i >= self.maxInputs():
             raise IndexError("%s has only %d inputs" % (self._name, self.maxInputs()))
         self._inputs[i] = node
@@ -359,12 +439,48 @@ def root():
 
 
 def reset(fmt=None):
-    global _root, _this
+    global _root, _this, _this_knob
     _root = None
     _this = None
+    _this_knob = None
     del _context[:]
     del _selected[:]
+    del inputs_queue[:]
+    del messages[:]
+    _layers[:] = ["rgba", "depth"]
     root()._format = fmt or Format(1920, 1080)
+    root()._add(Int_Knob("first_frame"))
+    root()._add(Int_Knob("last_frame"))
+    root()["first_frame"].setValue(1001)
+    root()["last_frame"].setValue(1010)
+
+
+def run_script(script, node, knob=None):
+    """Execute a knob script the way Nuke runs callbacks and buttons."""
+    global _this, _this_knob
+    _this, _this_knob = node, knob
+    try:
+        exec(script, {"nuke": __import__(__name__)})
+    finally:
+        _this, _this_knob = None, None
+
+
+def thisKnob():
+    return _this_knob
+
+
+def layers():
+    return list(_layers)
+
+
+def Layer(name, channels):
+    if name in _layers:
+        raise ValueError("layer %s exists" % name)
+    _layers.append(name)
+
+
+def getInput(prompt, default=""):
+    return inputs_queue.pop(0) if inputs_queue else None
 
 
 class _Nodes(object):
@@ -410,7 +526,7 @@ def thisNode():
 
 
 def message(text):
-    pass
+    messages.append(text)
 
 
 def nodeCopy(path):

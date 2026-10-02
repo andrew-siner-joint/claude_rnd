@@ -1,6 +1,18 @@
-"""Starting looks. Each preset lists only the knobs it changes from the
-defaults in spec.KNOBS; applying one resets every other look knob."""
+"""Preset looks.
 
+Built-in presets list only the knobs they change from the defaults in
+spec.KNOBS; applying one resets every other look knob.
+
+Saved presets are JSON files ({"name": ..., "knobs": {...}}) read from every
+folder on the BLINKFLARE_PRESET_PATH environment variable (os.pathsep
+separated, e.g. a shared studio or show folder) plus the personal folder
+~/.nuke/blinkflare_presets, which is also where new presets are saved
+(override with BLINKFLARE_PRESET_SAVE_DIR).
+"""
+
+import json
+import os
+import re
 from collections import OrderedDict
 
 PRESETS = OrderedDict([
@@ -149,3 +161,82 @@ PRESETS = OrderedDict([
         "spectral_length": 0.025,
     }),
 ])
+
+
+# ----------------------------------------------------------- saved presets
+
+def save_dir():
+    return os.environ.get("BLINKFLARE_PRESET_SAVE_DIR") or os.path.join(
+        os.path.expanduser("~"), ".nuke", "blinkflare_presets")
+
+
+def preset_dirs():
+    dirs = [d for d in os.environ.get("BLINKFLARE_PRESET_PATH", "").split(os.pathsep) if d]
+    personal = save_dir()
+    if personal not in dirs:
+        dirs.append(personal)
+    return dirs
+
+
+def _coerce(values):
+    """Keep only look knobs with sensible values; JSON lists become tuples."""
+    from blinkflare import spec
+    kinds = dict((k.name, k.kind) for k in spec.value_knobs())
+    out = {}
+    for name, v in values.items():
+        kind = kinds.get(name)
+        if kind is None or name in spec.NON_LOOK_KNOBS:
+            continue
+        if kind == "color":
+            v = tuple(float(c) for c in v)
+            if len(v) != 3:
+                continue
+        elif kind == "bool":
+            v = bool(v)
+        elif kind in ("int", "enum"):
+            v = int(v)
+        else:
+            v = float(v)
+        out[name] = v
+    return out
+
+
+def saved_presets():
+    """{name: knob values} from every preset folder; earlier folders win."""
+    found = OrderedDict()
+    for folder in preset_dirs():
+        if not os.path.isdir(folder):
+            continue
+        for fname in sorted(os.listdir(folder)):
+            if not fname.endswith(".json"):
+                continue
+            try:
+                with open(os.path.join(folder, fname)) as f:
+                    data = json.load(f)
+                name = str(data["name"])
+                knobs = _coerce(data["knobs"])
+            except (ValueError, KeyError, TypeError, OSError):
+                continue  # skip unreadable files rather than break the menu
+            if name not in found and name not in PRESETS:
+                found[name] = knobs
+    return found
+
+
+def all_presets():
+    merged = OrderedDict(PRESETS)
+    merged.update(saved_presets())
+    return merged
+
+
+def write_preset(name, values, folder=None):
+    """Save look knob values as a preset file. Returns the file path."""
+    if not name or name in PRESETS:
+        raise ValueError("Choose a name that isn't a built-in preset.")
+    folder = folder or save_dir()
+    if not os.path.isdir(folder):
+        os.makedirs(folder)
+    slug = re.sub(r"[^A-Za-z0-9_-]+", "_", name).strip("_") or "preset"
+    path = os.path.join(folder, slug + ".json")
+    with open(path, "w") as f:
+        json.dump({"name": name, "knobs": _coerce(values)}, f, indent=2, sort_keys=True)
+    return path

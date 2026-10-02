@@ -8,7 +8,7 @@ struct BfImage {
   int height;
 };
 
-void bf_create(BfImage canvas, BfImage occlusion, BfImage dirt, BfImage out);
+void bf_create(BfImage src, BfImage occlusion, BfImage dirt, BfImage out);
 void bf_init();
 void bf_process_rows(int y0, int y1);
 

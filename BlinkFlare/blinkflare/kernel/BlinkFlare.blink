@@ -14,16 +14,23 @@
 // t = 0 is on the light, t = 1 on the articulation point, t = 2 mirrored.
 //
 // Inputs:
-//   canvas     - defines output bounds; the flare is added on top of it.
-//   occlusion  - alpha is sampled around the light to dim the flare.
+//   src        - the plate. Defines the output bounds and is sampled around
+//                the light when brightness/color follow the source.
+//   occlusion  - alpha (or depth, copied into red) sampled around the light
+//                to dim the flare.
 //   dirt       - lens dirt texture lit by the flare.
+// The output is the flare alone; the group composites it.
+//
+// soloElement renders a single element (1 glow, 2 glints, 3 streaks, 4 ring,
+// 5 ghosts, 6 spectral, 7 dirt; 0 = all). The group uses it for the viewer
+// solo and for per-element output layers.
 //
 // Parameter labels match variable names so the BlinkScript knobs are
 // predictably named BlinkFlareKernel_<param>.
 
 kernel BlinkFlareKernel : ImageComputationKernel<ePixelWise>
 {
-  Image<eRead, eAccessPoint, eEdgeClamped> canvas;
+  Image<eRead, eAccessRandom, eEdgeClamped> src;
   Image<eRead, eAccessRandom, eEdgeConstant> occlusion;
   Image<eRead, eAccessPoint, eEdgeConstant> dirt;
   Image<eWrite> dst;
@@ -43,12 +50,22 @@ kernel BlinkFlareKernel : ImageComputationKernel<ePixelWise>
     bool   spinWithLight;
     float  elementAspect;
     float  offscreenFade;
+    int    soloElement;
 
-    // Occlusion
+    // Occlusion (mode 0 alpha, 1 depth as 1/z, 2 depth as z)
     bool   occlusionEnable;
+    int    occlusionMode;
     float  occlusionRadius;
     int    occlusionSamples;
     bool   occlusionInvert;
+    float  lightDepth;
+
+    // Brightness and color driven by the plate at the light
+    float  sourceIntensity;
+    float  sourceColor;
+    float  sourceRadius;
+    float  sourceBlack;
+    float  sourceWhite;
 
     // Glow and core
     bool   glowEnable;
@@ -166,10 +183,20 @@ kernel BlinkFlareKernel : ImageComputationKernel<ePixelWise>
     defineParam(elementAspect, "elementAspect", 1.0f);
     defineParam(offscreenFade, "offscreenFade", 0.5f);
 
+    defineParam(soloElement, "soloElement", 0);
+
     defineParam(occlusionEnable, "occlusionEnable", false);
+    defineParam(occlusionMode, "occlusionMode", 0);
     defineParam(occlusionRadius, "occlusionRadius", 20.0f);
     defineParam(occlusionSamples, "occlusionSamples", 16);
     defineParam(occlusionInvert, "occlusionInvert", false);
+    defineParam(lightDepth, "lightDepth", 100.0f);
+
+    defineParam(sourceIntensity, "sourceIntensity", 0.0f);
+    defineParam(sourceColor, "sourceColor", 0.0f);
+    defineParam(sourceRadius, "sourceRadius", 10.0f);
+    defineParam(sourceBlack, "sourceBlack", 0.0f);
+    defineParam(sourceWhite, "sourceWhite", 1.0f);
 
     defineParam(glowEnable, "glowEnable", true);
     defineParam(glowIntensity, "glowIntensity", 0.5f);
@@ -586,19 +613,48 @@ kernel BlinkFlareKernel : ImageComputationKernel<ePixelWise>
   void process(int2 pos)
   {
     float3 col = float3(0.0f, 0.0f, 0.0f);
+    float3 srcTint = float3(1.0f, 1.0f, 1.0f);
     float vis = _fade;
+    // Radii are given in thousandths of the frame height (proxy-safe).
+    float pxPerUnit = 0.001f / _invH;
 
     if (vis > 0.0f && occlusionEnable) {
       int ns = clamp(occlusionSamples, 1, 64);
+      float rad = occlusionRadius * pxPerUnit;
+      float invDepth = 1.0f / max(lightDepth, 0.000001f);
       float acc = 0.0f;
       for (int i = 0; i < ns; i++) {
-        float rr = occlusionRadius * sqrt((float(i) + 0.5f) / float(ns));
+        float rr = rad * sqrt((float(i) + 0.5f) / float(ns));
         float th = float(i) * 2.39996323f;
         float4 o = bilinear(occlusion, lightPos.x + rr * cos(th) / _pa - 0.5f, lightPos.y + rr * sin(th) - 0.5f);
-        acc += clamp(o.w, 0.0f, 1.0f);
+        if (occlusionMode == 1) {
+          acc += (o.x > invDepth) ? 1.0f : 0.0f;
+        } else if (occlusionMode == 2) {
+          acc += (o.x > 0.0f && o.x < lightDepth) ? 1.0f : 0.0f;
+        } else {
+          acc += clamp(o.w, 0.0f, 1.0f);
+        }
       }
       acc = acc / float(ns);
       vis = vis * (occlusionInvert ? acc : 1.0f - acc);
+    }
+
+    if (vis > 0.0f && (sourceIntensity > 0.0f || sourceColor > 0.0f)) {
+      float rad = sourceRadius * pxPerUnit;
+      float3 avg = float3(0.0f, 0.0f, 0.0f);
+      for (int i = 0; i < 16; i++) {
+        float rr = rad * sqrt((float(i) + 0.5f) / 16.0f);
+        float th = float(i) * 2.39996323f;
+        float4 c = bilinear(src, lightPos.x + rr * cos(th) / _pa - 0.5f, lightPos.y + rr * sin(th) - 0.5f);
+        avg += float3(max(c.x, 0.0f), max(c.y, 0.0f), max(c.z, 0.0f));
+      }
+      avg = avg / 16.0f;
+      float lum = 0.2126f * avg.x + 0.7152f * avg.y + 0.0722f * avg.z;
+      float level = clamp((lum - sourceBlack) / max(sourceWhite - sourceBlack, 0.00001f), 0.0f, 10.0f);
+      vis = vis * (1.0f + (level - 1.0f) * clamp(sourceIntensity, 0.0f, 1.0f));
+      if (sourceColor > 0.0f && lum > 0.000001f) {
+        srcTint = lfMix3(srcTint, avg / lum, clamp(sourceColor, 0.0f, 1.0f));
+      }
     }
 
     if (vis > 0.0f) {
@@ -608,33 +664,42 @@ kernel BlinkFlareKernel : ImageComputationKernel<ePixelWise>
       float rA = length(float2(d.x / _aspect, d.y));
       float ang = atan2(d.y, d.x);
 
-      if (glowEnable) {
+      bool all = soloElement < 1 || soloElement > 7;
+      bool dirtSolo = soloElement == 7;
+      // Dirt reacts to the other elements, so soloing it still evaluates them.
+      bool forDirt = dirtSolo && dirtEnable && dirtResponse > 0.0f;
+
+      if (glowEnable && (all || forDirt || soloElement == 1)) {
         col += glowTerm(rA);
       }
-      if (glintEnable) {
+      if (glintEnable && (all || forDirt || soloElement == 2)) {
         col += glintTerm(r, ang);
       }
-      if (streakEnable) {
+      if (streakEnable && (all || forDirt || soloElement == 3)) {
         col += streakTerm(d);
       }
-      if (ringEnable) {
+      if (ringEnable && (all || forDirt || soloElement == 4)) {
         col += ringTerm(P);
       }
-      if (ghostEnable) {
+      if (ghostEnable && (all || forDirt || soloElement == 5)) {
         col += ghostTerm(P);
       }
-      if (spectralEnable) {
+      if (spectralEnable && (all || forDirt || soloElement == 6)) {
         col += spectralTerm(r, ang);
       }
-      if (dirtEnable) {
+      if (dirtEnable && (all || dirtSolo)) {
         float4 dv = dirt();
-        col += dirtTerm(rA, col, dv);
+        float3 dc = dirtTerm(rA, col, dv);
+        if (dirtSolo) {
+          col = dc;
+        } else {
+          col += dc;
+        }
       }
-      col = col * lfRGB(masterTint) * (masterIntensity * vis);
+      col = col * lfRGB(masterTint) * srcTint * (masterIntensity * vis);
     }
 
-    float4 base = canvas();
     float a = clamp(max(col.x, max(col.y, col.z)), 0.0f, 1.0f);
-    dst() = float4(base.x + col.x, base.y + col.y, base.z + col.z, base.w + a);
+    dst() = float4(col.x, col.y, col.z, a);
   }
 };
