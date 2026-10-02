@@ -14,14 +14,18 @@ The kernel renders the flare alone; the Merge composites it so the operation,
 mix and mask behave like any Nuke merge and the source alpha passes through.
 Element Layers adds one solo kernel per element plus Copy nodes, built the
 first time it is switched on.
+
+Kernels are never compiled while a node is being built: the first create()
+compiles once in the background (see compiling.py) and caches the compiled
+node; every kernel after that is a paste of it.
 """
 
 import os
-import tempfile
+import traceback
 
 import nuke
 
-from blinkflare import camera, presets, spec
+from blinkflare import camera, compiling, presets, spec
 
 KERNEL_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "kernel", "BlinkFlare.blink")
 
@@ -33,6 +37,10 @@ class BuildError(RuntimeError):
     pass
 
 
+class StaleTemplate(BuildError):
+    """The cached compiled kernel doesn't match this version."""
+
+
 def kernel_source():
     with open(KERNEL_PATH) as f:
         return f.read()
@@ -40,21 +48,7 @@ def kernel_source():
 
 # --------------------------------------------------------------------- kernel
 
-def param_knob_name(blink, param):
-    """Name of the BlinkScript knob for kernel parameter ``param``, or None.
-
-    Nuke names them <Kernel>_<param>; plain and case-insensitive matches are
-    accepted too in case a version differs.
-    """
-    knobs = blink.knobs()
-    for name in ("%s_%s" % (spec.KERNEL_NAME, param), param):
-        if name in knobs:
-            return name
-    low = param.lower()
-    for name in sorted(knobs):
-        if name.lower() == low or name.lower().endswith("_" + low):
-            return name
-    return None
+param_knob_name = compiling.param_knob_name
 
 
 def param_knob(blink, param):
@@ -66,60 +60,18 @@ def param_knob(blink, param):
     return blink[name]
 
 
-def _process_events():
-    """Let Nuke run deferred UI work (some versions compile asynchronously)."""
-    for module in ("PySide6", "PySide2"):
-        try:
-            widgets = __import__(module + ".QtWidgets", fromlist=["QtWidgets"])
-        except ImportError:
-            continue
-        app = widgets.QApplication.instance()
-        if app is not None:
-            app.processEvents()
-        return
+def kernel_params():
+    """Every kernel parameter the group links to."""
+    return [k.blink for k in spec.value_knobs() if k.blink] + list(spec.DERIVED_PARAMS)
 
 
-def _compile_steps(blink, source):
-    """Ways of making a BlinkScript node compile from Python, in the order
-    tried. Which one takes effect synchronously differs between versions."""
-    def recompile():
-        blink["recompile"].execute()
-
-    def validate():
-        blink.forceValidate()
-
-    def from_file():
-        path = os.path.join(tempfile.gettempdir(), "BlinkFlare_%d.blink" % os.getpid())
-        with open(path, "w") as f:
-            f.write(source)
-        blink["kernelSourceFile"].setValue(path)
-        blink["reloadKernelSourceFile"].execute()
-        blink["recompile"].execute()
-
-    return [("recompile", recompile), ("validate", validate), ("events", _process_events),
-            ("file", from_file)]
+MANUAL_ROUTE = (
+    "To build it by hand instead: create a BlinkScript node, use its Load button on "
+    "blinkflare/kernel/BlinkFlare.blink, press Recompile, then with that node selected "
+    "run Nodes > Draw > BlinkFlare > Build From Compiled BlinkScript.")
 
 
-def compile_kernel(blink, source=None, probe="lightPos"):
-    """Compile ``source`` (default: BlinkFlare) on ``blink``. Returns the step
-    that worked; raises BuildError explaining what happened otherwise."""
-    if source is None:
-        source = kernel_source()
-    blink["kernelSource"].setValue(source)
-    errors = []
-    for name, step in _compile_steps(blink, source):
-        try:
-            step()
-        except Exception as e:  # Nuke raises plain RuntimeError from knob scripts
-            errors.append("%s: %s" % (name, e))
-        if param_knob_name(blink, probe) is not None:
-            if name == "file" and blink.knob("kernelSourceFile") is not None:
-                blink["kernelSourceFile"].setValue("")
-            return name
-    raise BuildError(compile_failure_message(blink, probe, errors))
-
-
-def compile_failure_message(blink, probe, errors=()):
+def compile_failure_message(result):
     def flag(key):
         try:
             return nuke.env[key]
@@ -130,17 +82,62 @@ def compile_failure_message(blink, probe, errors=()):
         licence = "NukeX/Studio"
     else:
         licence = "not NukeX - compiling Blink kernels needs NukeX or Nuke Studio"
-    has_error = blink.hasError() if hasattr(blink, "hasError") else "?"
-    lines = [
-        "BlinkFlare's Blink kernel did not compile: the BlinkScript node has no "
-        "knob for its '%s' parameter." % probe,
-        "Nuke %s (%s). BlinkScript node in error: %s." % (version, licence, has_error),
-    ]
-    if errors:
-        lines.append("Compile attempts raised: " + "; ".join(errors))
-    lines.append("For a full diagnosis run Nodes > Draw > BlinkFlare > Check Install... "
-                 "(or install_blinkflare.py from the Script Editor) and send the report it saves.")
-    return "\n".join(lines)
+    return "\n\n".join([
+        "BlinkFlare's Blink kernel did not compile: %s." % result.describe(),
+        "Nuke %s (%s)." % (version, licence),
+        "Run Nodes > Draw > BlinkFlare > Check Install... for a full report.",
+        MANUAL_ROUTE,
+    ])
+
+
+def show_error(message):
+    print(message)
+    if nuke.GUI:
+        nuke.message(message)
+
+
+def _delete_quietly(node):
+    try:
+        nuke.delete(node)
+    except Exception:
+        pass  # already gone, e.g. the user deleted it while it compiled
+
+
+def kernel_template(ready, on_error):
+    """Call ``ready(path)`` with the saved compiled kernel, compiling and
+    saving it first (in the background) if this version has none yet."""
+    source = kernel_source()
+    path = compiling.template_path(source)
+    if os.path.isfile(path):
+        ready(path)
+        return
+    with nuke.root():
+        holder = nuke.nodes.Group(name="BlinkFlare_compiling")
+    with holder:
+        node = nuke.nodes.BlinkScript(name=spec.KERNEL_NODE)
+        if node.knob("useGPUIfAvailable") is not None:
+            node["useGPUIfAvailable"].setValue(False)  # CPU-only compiles much faster
+    progress = compiling.Progress(
+        "BlinkFlare", "Compiling the BlinkFlare kernel. This only happens the first time.")
+
+    def done(result):
+        progress.close()
+        failure = None
+        try:
+            if result.ok:
+                compiling.save_template(node, holder, path)
+        except Exception:
+            failure = "Saving the compiled kernel failed:\n" + traceback.format_exc()
+        finally:
+            _delete_quietly(holder)
+        if failure:
+            on_error(failure)
+        elif result.ok:
+            ready(path)
+        elif result.mode != "cancelled":
+            on_error(compile_failure_message(result))
+
+    compiling.compile_async(node, source, "lightPos", done, progress=progress)
 
 
 def link_kernel_params(blink):
@@ -159,9 +156,12 @@ def _set_expressions(knob, exprs):
             knob.setExpression(expr, channel)
 
 
-def make_kernel(name, inputs, solo=None):
-    blink = nuke.nodes.BlinkScript(name=name)
-    compile_kernel(blink)
+def make_kernel(name, inputs, template, solo=None):
+    """Paste the compiled kernel from ``template`` and wire it up."""
+    blink = compiling.paste_template(template, name)
+    missing = [p for p in kernel_params() if param_knob_name(blink, p) is None]
+    if missing:
+        raise StaleTemplate("the saved kernel %s lacks params %s" % (template, ", ".join(missing)))
     for i, node in enumerate(inputs):
         blink.setInput(i, node)
     link_kernel_params(blink)
@@ -324,7 +324,7 @@ def build_projection(canvas, cam_in, axis_in):
     return proj
 
 
-def build_internals(group):
+def build_internals(group, template):
     """Create the node graph inside ``group``. Returns the main kernel."""
     with group:
         names = ["src", "occlusion", "dirt", "cam", "axis", "mask"]
@@ -371,7 +371,9 @@ def build_internals(group):
 
         build_projection(canvas, ins["cam"], ins["axis"])
 
-        blink = make_kernel(spec.KERNEL_NODE, [canvas, occ, dirt])
+        blink = make_kernel(spec.KERNEL_NODE, [canvas, occ, dirt], template)
+        if blink.knob("useGPUIfAvailable") is not None:
+            blink["useGPUIfAvailable"].setValue(True)
         blink.setXYpos(220, 260)
 
         mb = nuke.nodes.TimeBlur(name=spec.MOTION_BLUR_NODE, inputs=[blink])
@@ -397,14 +399,12 @@ def build_internals(group):
     return blink
 
 
-def create():
-    """Create a BlinkFlare node below the selected node (or on its own)."""
-    sel, fmt = _input_format()
+def build_group(sel, fmt, template):
     group = nuke.nodes.Group()
     try:
         group.setName("BlinkFlare1")
         group["tile_color"].setValue(0xE8A33DFF)
-        build_internals(group)
+        build_internals(group, template)
         add_group_knobs(group, fmt)
     except Exception:
         nuke.delete(group)
@@ -421,6 +421,59 @@ def create():
     return group
 
 
+def create(on_done=None, on_error=None):
+    """Create a BlinkFlare node below the selected node (or on its own).
+
+    Returns the node when it could be built straight away (the compiled
+    kernel is cached). The first time, the kernel compiles in the background
+    and the node appears when it's done: ``on_done(node)`` is called then,
+    or ``on_error(message)`` if it can't be built.
+    """
+    sel, fmt = _input_format()
+    on_error = on_error or show_error
+    built = []
+
+    def ready(template, retry=True):
+        try:
+            group = build_group(sel, fmt, template)
+        except StaleTemplate:
+            os.remove(template)
+            if retry:
+                kernel_template(lambda path: ready(path, retry=False), on_error)
+            else:
+                on_error("The freshly compiled kernel is missing parameters.\n\n" + MANUAL_ROUTE)
+            return
+        except Exception:
+            on_error("Building BlinkFlare failed:\n" + traceback.format_exc())
+            return
+        built.append(group)
+        if on_done is not None:
+            on_done(group)
+
+    kernel_template(ready, on_error)
+    return built[0] if built else None
+
+
+def create_from_kernel(node, on_done=None, on_error=None):
+    """Build BlinkFlare around a BlinkScript node compiled by hand.
+
+    The manual route for when compiling from Python doesn't work: load
+    BlinkFlare.blink into a BlinkScript node, press Recompile, select it and
+    run this. The compiled kernel is saved, so later creates are instant.
+    """
+    if node is None or node.Class() != "BlinkScript":
+        raise BuildError("Select a BlinkScript node that has the BlinkFlare kernel compiled.")
+    missing = [p for p in kernel_params() if param_knob_name(node, p) is None]
+    if missing:
+        raise BuildError("The selected BlinkScript node doesn't have the BlinkFlare kernel "
+                         "compiled (missing knobs for %s). Load blinkflare/kernel/BlinkFlare.blink "
+                         "with its Load button and press Recompile first." % ", ".join(missing[:5]))
+    full = node.fullName()
+    context = nuke.root() if "." not in full else nuke.toNode("root." + full.rsplit(".", 1)[0])
+    compiling.save_template(node, context, compiling.template_path(kernel_source()))
+    return create(on_done, on_error)
+
+
 # ------------------------------------------------------------ element layers
 
 def build_element_layers(group):
@@ -432,8 +485,12 @@ def build_element_layers(group):
     first = spec.ELEMENTS[0][1]
     if group.node("%s_%s" % (spec.KERNEL_NODE, first)) is not None:
         return
+    main = group.node(spec.KERNEL_NODE)
+    # Clone this node's own compiled kernel: no compiles, and it matches
+    # whatever version the node was built with.
+    template = os.path.join(compiling.cache_dir(), "layers_%d.nk" % os.getpid())
+    compiling.save_template(main, group, template)
     with group:
-        main = group.node(spec.KERNEL_NODE)
         mb = group.node(spec.MOTION_BLUR_NODE)
         switch = group.node(spec.SWITCH_NODE)
         inputs = [main.input(i) for i in range(3)]
@@ -443,7 +500,7 @@ def build_element_layers(group):
         for i, (index, name, layer) in enumerate(spec.ELEMENTS):
             if layer not in nuke.layers():
                 nuke.Layer(layer, ["%s.%s" % (layer, c) for c in RGBA])
-            inst = make_kernel("%s_%s" % (spec.KERNEL_NODE, name), inputs, solo=index)
+            inst = make_kernel("%s_%s" % (spec.KERNEL_NODE, name), inputs, template, solo=index)
             inst["disable"].setExpression(off)
             for knob in ("useGPUIfAvailable", "vectorize"):
                 if inst.knob(knob) is not None:
@@ -566,7 +623,7 @@ def save_preset(node, name=None):
 
 # ------------------------------------------------------------------ toolset
 
-def save_toolset(path=None):
+def save_toolset(path=None, on_done=None, on_error=None):
     """Build a BlinkFlare node and save it as a ToolSet .nk.
 
     The saved node carries the compiled kernel, so it can be shared with
@@ -577,15 +634,24 @@ def save_toolset(path=None):
     folder = os.path.dirname(path)
     if folder and not os.path.isdir(folder):
         os.makedirs(folder)
+    saved = []
+
+    def write(node):
+        node.setInput(0, None)
+        try:
+            for n in nuke.selectedNodes():
+                n.setSelected(False)
+            node.setSelected(True)
+            nuke.nodeCopy(path)
+        finally:
+            nuke.delete(node)
+        saved.append(path)
+        if on_done is not None:
+            on_done(path)
+        elif nuke.GUI:
+            nuke.message("Saved " + path)
+
     for n in nuke.selectedNodes():
         n.setSelected(False)
-    node = create()
-    node.setInput(0, None)
-    try:
-        for n in nuke.selectedNodes():
-            n.setSelected(False)
-        node.setSelected(True)
-        nuke.nodeCopy(path)
-    finally:
-        nuke.delete(node)
-    return path
+    create(write, on_error)
+    return saved[0] if saved else None

@@ -146,19 +146,26 @@ Requires NukeX or Nuke Studio 13 or later (Python 3) to build the node.
 
 ### Easiest: the installer script
 
-1. Copy the `BlinkFlare` folder somewhere permanent.
+1. Copy the `BlinkFlare` folder somewhere permanent, and restart Nuke if an
+   older copy was loaded.
 2. In Nuke's Script Editor, click **Source a script** and pick
    `BlinkFlare/install_blinkflare.py`. Or paste the file's contents into the
    Script Editor and run it.
 3. If it can't tell where it lives, it asks: pick the `BlinkFlare` folder or
    `blinkflare/kernel/BlinkFlare.blink`.
 
-It checks that this Nuke can compile Blink kernels from Python, compiles
-BlinkFlare and builds a test node. It also offers to add BlinkFlare to
-`~/.nuke/init.py` and puts the menu in place for the current session. A
-report is printed, saved to `~/.nuke/blinkflare_report.txt` and copied to the
-clipboard. If the kernel is rejected, the report says which kernel function
-Nuke rejected, so send it back. Once installed, the same check is under
+A progress window (with Cancel) shows each step, and Nuke stays responsive
+throughout:
+1. It compiles a tiny test kernel, then the BlinkFlare kernel, timing both.
+2. It builds a test node, caching the compiled kernel along the way.
+3. It offers to add BlinkFlare to `~/.nuke/init.py`, and puts the menu in
+   place for the current session.
+
+The report is written to `~/.nuke/blinkflare_report.txt` line by line as it
+goes, with timestamps, and is copied to the clipboard at the end. If the
+BlinkFlare kernel is rejected, it compiles a few more test kernels and works
+out which kernel function Nuke rejected; send the report back. Once
+installed, the same check is under
 **Nodes > Draw > BlinkFlare > Check Install...**.
 
 ### By hand
@@ -173,12 +180,30 @@ nuke.pluginAddPath("/path/to/BlinkFlare")
 The node is under **Nodes > Draw > BlinkFlare**, or press Tab and type
 `BlinkFlare`.
 
+### First use
+
+The first BlinkFlare node needs its kernel compiled, which can take a while.
+It happens in the background with a progress window, and the node appears
+when it's done. The compiled kernel is cached in `~/.nuke/blinkflare_cache`
+(override with `BLINKFLARE_CACHE_DIR`), so every node after that, and every
+element layer, is created instantly without compiling. Updating BlinkFlare
+changes the kernel, so the next node compiles once again.
+
+If compiling from Python doesn't work on your setup, compile it by hand and
+let BlinkFlare build around it:
+1. Create a BlinkScript node.
+2. Use its **Load** button on `blinkflare/kernel/BlinkFlare.blink`, then
+   press **Recompile**.
+3. With that node selected, run **Draw > BlinkFlare > Build From Compiled
+   BlinkScript**. That also fills the cache.
+
 ### Troubleshooting
 
-| Message | Meaning |
+| Symptom | What to do |
 |---|---|
-| *"BlinkFlare's Blink kernel did not compile..."* | Nuke didn't produce the kernel's parameter knobs. Run **Check Install...** for the reason (licence, a rejected kernel function, or a Nuke version that compiles differently). |
-| *"Nuke has a different BlinkFlare copy loaded"* (in the report) | An older copy is on the plugin path. Remove or update that `pluginAddPath` line. |
+| *"BlinkFlare's Blink kernel did not compile..."* | Run **Check Install...** for the reason (licence, a rejected kernel function, or a compile that never finishes), or use the by-hand route above. |
+| Nuke froze while installing (older `install_blinkflare.py`) | Force-quit Nuke and use the current installer. It never blocks Nuke while waiting for a compile. |
+| *"Nuke had a different BlinkFlare copy loaded"* (in the report) | An older copy is on the plugin path. Remove or update that `pluginAddPath` line, then restart Nuke. |
 | No BlinkFlare menu | `init.py` doesn't reach the folder, or Nuke wasn't restarted. Check Install fixes the menu for the current session. |
 
 ### Sharing with plain-Nuke seats
@@ -216,6 +241,7 @@ BlinkFlare/
   menu.py, init.py           Nuke startup files (menu entries)
   blinkflare/
     kernel/BlinkFlare.blink  the BlinkScript kernel (all rendering)
+    compiling.py             compiling from Python without blocking Nuke; kernel cache
     spec.py                  every group knob and the kernel param it drives
     camera.py                3D projection: Nuke expressions + Python reference
     presets.py               built-in presets and the saved-preset library
@@ -244,7 +270,7 @@ Nuke isn't needed to run the tests:
 
 ```sh
 pip install numpy pillow
-python3 -m unittest discover -s tests          # 101 tests
+python3 -m unittest discover -s tests          # 114 tests
 python3 tests/harness/preview.py --preset "Sci-Fi Hoop" --out flare.png
 python3 tests/harness/preview.py --set ghost_count=30 --set ghost_blades=5 --out flare.png
 cd tests/harness && python3 preview.py --docs ../../docs/previews   # README images

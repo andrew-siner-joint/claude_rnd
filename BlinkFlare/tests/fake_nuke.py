@@ -5,6 +5,7 @@ expressions on out-of-range channels raise, and the fake BlinkScript node
 creates its param knobs by parsing the kernel source, like Nuke does on
 compile.
 """
+import json
 import re
 
 STARTLINE = 0x1000
@@ -16,6 +17,9 @@ env = {"nukex": True}
 BLINK_COMPILE_ON = {"recompile"}  # triggers that compile: recompile, validate, file
 BLINK_REJECT = []                 # source snippets the fake "compiler" rejects
 BLINK_PREFIX = None               # param knob prefix; None = "<Kernel>_"
+BLINK_ASYNC_POLLS = 0             # >0: compile finishes after this many knob lookups
+compile_count = [0]
+compile_gpu = []  # useGPUIfAvailable at each compile
 
 
 class Format(object):
@@ -304,6 +308,8 @@ class Node(object):
             self._add(factory(kname))
         if cls not in NO_DISABLE:
             self._add(Boolean_Knob("disable"))
+        if cls == "BlinkScript":
+            self["useGPUIfAvailable"].setValue(True)  # Nuke's default
         if parent is not None:
             parent._children.append(self)
             self.setName(cls + "1")
@@ -322,6 +328,10 @@ class Node(object):
         return self._knobs[name]
 
     def knobs(self):
+        if getattr(self, "_pending", 0):
+            self._pending -= 1  # a deferred compile progresses as Nuke runs
+            if self._pending == 0:
+                self._compile()
         return dict(self._knobs)
 
     def addKnob(self, knob):
@@ -435,9 +445,15 @@ class Node(object):
 
     def _trigger(self, kind):
         if kind in BLINK_COMPILE_ON:
-            self._compile()
+            if BLINK_ASYNC_POLLS:
+                self._pending = BLINK_ASYNC_POLLS
+            else:
+                self._compile()
 
     def _compile(self):
+        compile_count[0] += 1
+        gpu = self.knob("useGPUIfAvailable")
+        compile_gpu.append(bool(gpu.value()) if gpu is not None else None)
         for name in getattr(self, "_param_knobs", []):
             self._knobs.pop(name, None)
         self._param_knobs = []
@@ -473,9 +489,12 @@ def root():
 
 
 def reset(fmt=None):
-    global _root, _this, _this_knob, BLINK_COMPILE_ON, BLINK_PREFIX
+    global _root, _this, _this_knob, BLINK_COMPILE_ON, BLINK_PREFIX, BLINK_ASYNC_POLLS
     BLINK_COMPILE_ON = {"recompile"}
     BLINK_PREFIX = None
+    BLINK_ASYNC_POLLS = 0
+    compile_count[0] = 0
+    del compile_gpu[:]
     del BLINK_REJECT[:]
     env.clear()
     env["nukex"] = True
@@ -612,12 +631,20 @@ def selectedNodes():
 
 
 def delete(node):
+    if node not in node._parent._children:
+        raise ValueError("PythonObject not attached to a node")
     node._parent._children.remove(node)
     node.setSelected(False)
+    for child in list(node._children):
+        child.setSelected(False)
 
 
 def toNode(name):
-    return _current().child(name)
+    parts = name.split(".")
+    node = root() if parts[0] == "root" else _current()
+    for part in parts[1:] if parts[0] == "root" else parts:
+        node = node.child(part) if node is not None else None
+    return node
 
 
 def thisNode():
@@ -629,8 +656,42 @@ def message(text):
 
 
 def nodeCopy(path):
+    """Serialize the selected nodes, roughly like a .nk snippet."""
+    data = []
+    for n in _selected:
+        knobs = {}
+        for name, k in n._knobs.items():
+            knobs[name] = {"values": k.values, "channels": k.channels,
+                           "expressions": dict((str(c), e) for c, e in k.expressions.items())}
+        data.append({"class": n._class, "name": n._name, "knobs": knobs,
+                     "params": getattr(n, "_param_knobs", [])})
     with open(path, "w") as f:
-        f.write("# fake toolset: %s\n" % ", ".join(n.name() for n in _selected))
+        json.dump(data, f)
+
+
+def nodePaste(path):
+    """Recreate copied nodes in the current context and select them.
+    BlinkScript param knobs come back as Nuke restores them from the saved
+    kernel description: without a recompile."""
+    with open(path) as f:
+        data = json.load(f)
+    for n in list(_selected):
+        n.setSelected(False)
+    for entry in data:
+        node = Node(entry["class"], _current())
+        node.setName(entry["name"])
+        for name, saved in entry["knobs"].items():
+            knob = node.knob(name)
+            if knob is None:
+                knob = Knob(name)
+                knob.channels = saved["channels"]
+                node._add(knob)
+            knob.values = list(saved["values"])
+            knob.expressions = dict((int(c), e) for c, e in saved["expressions"].items())
+        if entry["params"]:
+            node._param_knobs = list(entry["params"])
+            node._max_inputs = len(re.findall(r"Image<eRead", node["kernelSource"].value()))
+        node.setSelected(True)
 
 
 class Undo(object):

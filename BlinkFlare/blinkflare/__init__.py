@@ -10,10 +10,28 @@ used (and tested) outside Nuke.
 from blinkflare.spec import VERSION  # noqa: F401
 
 
-def create():
-    """Create a BlinkFlare node connected to the selected node."""
+def create(on_done=None, on_error=None):
+    """Create a BlinkFlare node connected to the selected node.
+
+    The first time, the kernel compiles in the background and the node
+    appears when it's ready (``on_done(node)``); after that it's instant.
+    """
     from blinkflare import builder
-    return builder.create()
+    return builder.create(on_done, on_error)
+
+
+def create_from_selected():
+    """Build BlinkFlare around a selected, hand-compiled BlinkScript node."""
+    import nuke
+    from blinkflare import builder
+    try:
+        node = nuke.selectedNode()
+    except ValueError:
+        node = None
+    try:
+        return builder.create_from_kernel(node)
+    except builder.BuildError as e:
+        nuke.message(str(e))
 
 
 def apply_preset(node, name=None):
@@ -54,7 +72,7 @@ def diagnose():
     runpy.run_path(os.path.join(root, "install_blinkflare.py"), run_name="__main__")
 
 
-def save_toolset(path=None):
+def save_toolset(path=None, on_done=None):
     """Save a ready-built BlinkFlare as a ToolSet .nk (for non-NukeX seats)."""
     from blinkflare import builder
-    return builder.save_toolset(path)
+    return builder.save_toolset(path, on_done)

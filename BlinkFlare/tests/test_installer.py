@@ -3,10 +3,12 @@ import contextlib
 import importlib.util
 import io
 import os
+import re
 import subprocess
 import sys
 import tempfile
 import unittest
+from unittest import mock
 
 import kernel_parse
 import fake_nuke
@@ -25,8 +27,25 @@ def load_installer():
     return module
 
 
+class FakeClock(object):
+    def __init__(self):
+        self.now = 1000.0
+
+    def time(self):
+        return self.now
+
+    def sleep(self, seconds):
+        self.now += seconds
+
+
 class InstallerTest(unittest.TestCase):
     def setUp(self):
+        # The installer re-imports blinkflare, so patch time where it looks.
+        self.clock = FakeClock()
+        self.patches = [mock.patch("time.time", self.clock.time),
+                        mock.patch("time.sleep", self.clock.sleep)]
+        for p in self.patches:
+            p.start()
         self.tmp = tempfile.TemporaryDirectory()
         self.env = dict(os.environ)
         os.environ["HOME"] = self.tmp.name
@@ -37,6 +56,8 @@ class InstallerTest(unittest.TestCase):
         self.init_py = os.path.join(self.tmp.name, ".nuke", "init.py")
 
     def tearDown(self):
+        for p in self.patches:
+            p.stop()
         os.environ.clear()
         os.environ.update(self.env)
         self.tmp.cleanup()
@@ -64,9 +85,11 @@ class InstallerTest(unittest.TestCase):
 
     def test_healthy_install(self):
         report = self.run_main()
-        self.assertIn("ok    basic kernel", report)
-        self.assertIn("Compiled via 'recompile'", report)
+        self.assertIn("ok    basic kernel: compiled at once", report)
+        self.assertIn("ok    BlinkFlare kernel: compiled at once", report)
         self.assertIn("Built BlinkFlare1", report)
+        self.assertNotIn("More test kernels", report)  # only run when something fails
+        self.assertEqual(set(fake_nuke.compile_gpu), {False})  # test compiles are CPU-only
         self.assertNotIn("PROBLEM", report)
         self.assertIn("installed and working", fake_nuke.messages[-1])
         self.assertEqual(self.root_nodes(), ["BlinkFlare1"])  # sandbox removed, node kept
@@ -98,16 +121,53 @@ class InstallerTest(unittest.TestCase):
         self.assertIn("unchanged", report)
         self.assertFalse(os.path.exists(self.init_py))
 
-    def test_deferred_compile_is_reported(self):
-        fake_nuke.BLINK_COMPILE_ON = {"validate"}
+    def test_deferred_compile_is_waited_for_and_timed(self):
+        fake_nuke.BLINK_ASYNC_POLLS = 12
         report = self.run_main()
-        self.assertIn("compiled via 'validate'", report)
+        self.assertRegex(report, r"ok    basic kernel: compiled after \d+\.\ds")
         self.assertIn("Built BlinkFlare1", report)
+
+    def test_rejected_kernel_gives_up_quickly(self):
+        fake_nuke.BLINK_REJECT.append("lfWrapPi(ang - a)")
+        report = self.run_main()
+        self.assertIn("Nuke rejected the kernel", report)
+        self.assertLess(self.clock.now - 1000.0, 3 * 60)  # not a 5-minute timeout per compile
+
+    def test_compile_that_never_finishes_times_out(self):
+        fake_nuke.BLINK_COMPILE_ON = set()
+        report = self.run_main()
+        self.assertIn("FAIL  basic kernel: no parameter knobs after 120s", report)
+        self.assertIn("did not compile: no parameter knobs after 300s", report)
+
+    def test_report_survives_a_crashing_step(self):
+        original = self.inst.Diagnostic.step_kernel
+        self.inst.Diagnostic.step_kernel = lambda self_: 1 / 0
+        try:
+            report = self.run_main()
+        finally:
+            self.inst.Diagnostic.step_kernel = original
+        self.assertIn("A check failed unexpectedly", report)
+        self.assertIn("ZeroDivisionError", report)
+        self.assertIn("Report saved to", report)
+        self.assertNotIn("BlinkFlare_check", self.root_nodes())
+
+    def test_cancel_stops_the_checks(self):
+        fake_nuke.BLINK_REJECT.append("lfWrapPi(ang - a)")
+        original = self.inst.import_package
+
+        def import_then_cancel(rep, root):
+            package = original(rep, root)  # the installer imports a fresh copy
+            package[2].Progress.cancelled = lambda _self: True
+            return package
+        self.inst.import_package = import_then_cancel
+        report = self.run_main()
+        self.assertIn("Cancelled.", report)
+        self.assertNotIn("checking functions one by one", report)
 
     def test_unprefixed_param_knobs(self):
         fake_nuke.BLINK_PREFIX = ""
         report = self.run_main()
-        self.assertIn("param knob named 'probeGain'", report)
+        self.assertIn("param knob 'probeGain'", report)
         self.assertIn("Built BlinkFlare1", report)
 
     def test_rejected_function_is_found(self):
@@ -142,6 +202,20 @@ class InstallerTest(unittest.TestCase):
             if saved is not None:
                 sys.modules["blinkflare"] = saved
         self.assertIn("different BlinkFlare copy", report)
+
+
+class NoBlockingCalls(unittest.TestCase):
+    """Waiting on a compile by blocking Nuke's main thread is what froze it."""
+
+    def test_no_blocking_waits(self):
+        files = [os.path.join(ROOT, "install_blinkflare.py")]
+        files += [os.path.join(ROOT, "blinkflare", f) for f in os.listdir(os.path.join(ROOT, "blinkflare"))
+                  if f.endswith(".py")]
+        for path in files:
+            with open(path) as f:
+                code = "\n".join(line.split("#")[0] for line in f.read().splitlines())
+            for call in ("forceValidate(", "processEvents(", "time.sleep(", "nuke.ProgressTask("):
+                self.assertNotIn(call, code, "%s calls %s" % (path, call))
 
 
 class StubbedKernelsCompile(unittest.TestCase):

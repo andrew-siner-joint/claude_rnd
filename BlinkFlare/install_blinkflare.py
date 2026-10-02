@@ -4,36 +4,41 @@ How to run it, either:
   * Script Editor: click "Source a script" (the folder-with-arrow icon) and
     pick this file, or
   * open this file in a text editor, copy all of it, paste it into the
-    Script Editor and press Run (Ctrl/Cmd+Enter).
+    Script Editor and press Run (Ctrl/Cmd+Enter), or
+  * once installed: Nodes > Draw > BlinkFlare > Check Install...
 
 What it does:
   1. Asks where BlinkFlare is: pick the BlinkFlare folder, or the
      BlinkFlare.blink file inside it (blinkflare/kernel/BlinkFlare.blink).
-  2. Checks that this Nuke can compile Blink kernels from Python, using a few
-     tiny test kernels, and records how it names kernel parameter knobs.
-  3. Compiles the BlinkFlare kernel. If Nuke rejects it, narrows down which
-     function(s) Nuke rejects.
-  4. Builds a BlinkFlare node.
-  5. Offers to add BlinkFlare to ~/.nuke/init.py and its menu entries.
+  2. Compiles a tiny test kernel and the BlinkFlare kernel, timing how long
+     Nuke takes. If BlinkFlare is rejected, it compiles a few more test
+     kernels and narrows down which kernel function Nuke rejects.
+  3. Builds a BlinkFlare node from the compiled kernel (and caches it, so
+     later BlinkFlare nodes appear instantly).
+  4. Offers to add BlinkFlare to ~/.nuke/init.py and its menu entries.
 
-A report is printed here, saved to ~/.nuke/blinkflare_report.txt and copied
-to the clipboard. If anything fails, send that report back.
+Nuke stays responsive while it works: compiles run in the background and a
+progress window (with Cancel) shows what is happening. The report is written
+to ~/.nuke/blinkflare_report.txt line by line as it goes, so even if Nuke
+stops responding, that file shows how far it got. It is also printed here and
+copied to the clipboard at the end. If anything fails, send that report back.
 
-Nothing is left in your script except the BlinkFlare node (if you keep it);
-test nodes are built inside a temporary group that is deleted at the end.
+Test nodes are built inside a temporary group that is deleted at the end.
 """
 
 import os
 import platform
 import re
 import sys
-import tempfile
+import time
 import traceback
 
 import nuke
 
 KERNEL_REL = os.path.join("blinkflare", "kernel", "BlinkFlare.blink")
 FIRST_PARAM = "lightPos"
+PROBE_TIMEOUT = 120.0
+KERNEL_TIMEOUT = 300.0
 
 
 def env_flag(key):
@@ -46,14 +51,29 @@ def env_flag(key):
 
 # ----------------------------------------------------------------- reporting
 
+def report_path():
+    return os.path.join(os.path.expanduser("~"), ".nuke", "blinkflare_report.txt")
+
+
 class Report(object):
-    def __init__(self):
+    """Prints each line and appends it to the report file straight away."""
+
+    def __init__(self, path):
+        self.path = path
         self.lines = []
         self.problems = []
+        self.start = time.time()
+        folder = os.path.dirname(path)
+        if not os.path.isdir(folder):
+            os.makedirs(folder)
+        open(path, "w").close()
 
     def __call__(self, text=""):
-        print(text)
-        self.lines.append(text)
+        line = "[%6.1fs] %s" % (time.time() - self.start, text) if text else ""
+        print(line)
+        self.lines.append(line)
+        with open(self.path, "a") as f:
+            f.write(line + "\n")
 
     def section(self, title):
         self("")
@@ -65,10 +85,6 @@ class Report(object):
 
     def text(self):
         return "\n".join(self.lines) + "\n"
-
-
-def report_path():
-    return os.path.join(os.path.expanduser("~"), ".nuke", "blinkflare_report.txt")
 
 
 # ------------------------------------------------------------------ locating
@@ -97,88 +113,6 @@ def locate():
     picked = nuke.getFilename(
         "Locate BlinkFlare: pick the BlinkFlare folder or BlinkFlare.blink", "*.blink")
     return find_root(picked) if picked else None
-
-
-# ------------------------------------------------------------------ compiling
-
-def param_knob(node, param):
-    """Name of the knob BlinkScript made for ``param``, however it's prefixed."""
-    low = param.lower()
-    for name in sorted(node.knobs()):
-        if name.lower() == low or name.lower().endswith("_" + low):
-            return name
-    return None
-
-
-def process_events():
-    for module in ("PySide6", "PySide2"):
-        try:
-            widgets = __import__(module + ".QtWidgets", fromlist=["QtWidgets"])
-        except ImportError:
-            continue
-        app = widgets.QApplication.instance()
-        if app is not None:
-            app.processEvents()
-        return
-
-
-def compile_steps(node, source):
-    """The same compile triggers blinkflare.builder tries, in the same order."""
-    def recompile():
-        node["recompile"].execute()
-
-    def validate():
-        node.forceValidate()
-
-    def from_file():
-        path = os.path.join(tempfile.gettempdir(), "BlinkFlare_diag_%d.blink" % os.getpid())
-        with open(path, "w") as f:
-            f.write(source)
-        node["kernelSourceFile"].setValue(path)
-        node["reloadKernelSourceFile"].execute()
-        node["recompile"].execute()
-
-    return [("recompile", recompile), ("validate", validate), ("events", process_events),
-            ("file", from_file)]
-
-
-class CompileResult(object):
-    def __init__(self):
-        self.step = None
-        self.knob = None
-        self.new_knobs = []
-        self.errors = []
-        self.in_error = None
-
-    @property
-    def ok(self):
-        return self.step is not None
-
-
-def try_compile(source, param):
-    """Compile ``source`` on a fresh BlinkScript node and delete it again."""
-    result = CompileResult()
-    node = nuke.nodes.BlinkScript()
-    try:
-        before = set(node.knobs())
-        node["kernelSource"].setValue(source)
-        for name, step in compile_steps(node, source):
-            try:
-                step()
-            except Exception as e:
-                result.errors.append("%s: %s" % (name, e))
-            result.knob = param_knob(node, param)
-            if result.knob:
-                result.step = name
-                break
-        result.new_knobs = sorted(set(node.knobs()) - before)
-        try:
-            result.in_error = node.hasError()
-        except Exception:
-            pass
-    finally:
-        nuke.delete(node)
-    return result
 
 
 # Each probe exercises one group of Blink features BlinkFlare relies on.
@@ -377,43 +311,15 @@ def stub_functions(source, keep):
     return "".join(out)
 
 
-def bisect(rep, source, task=None):
-    """Find which kernel functions Nuke rejects. Returns their names."""
-    names = [n for n in kernel_functions(source) if n != "define"]
-    rep("Compiling copies of the kernel with function bodies emptied out...")
-    base = try_compile(stub_functions(source, ()), FIRST_PARAM)
-    if not base.ok:
-        rep.problem("Nuke rejects the kernel even with every function emptied, so the problem "
-                    "is in its declarations (inputs, params, locals) or define().")
-        return []
-    culprits = []
-    for i, name in enumerate(names):
-        if task is not None:
-            if task.isCancelled():
-                rep("(cancelled)")
-                break
-            task.setMessage("Checking %s" % name)
-            task.setProgress(int(60 + 35 * i / max(len(names), 1)))
-        if not try_compile(stub_functions(source, (name,)), FIRST_PARAM).ok:
-            culprits.append(name)
-    if culprits:
-        rep.problem("Nuke rejects these kernel functions: " + ", ".join(culprits))
-        for m in FUNC_RE.finditer(source):
-            if m.group(2) in culprits:
-                line = source.count("\n", 0, m.start()) + 1
-                rep("  %s starts at line %d of BlinkFlare.blink" % (m.group(2), line))
-    else:
-        rep("Every function compiles on its own; the failure only shows up in combination.")
-    return culprits
 
 
-# --------------------------------------------------------------------- steps
+# --------------------------------------------------------------- the checks
 
 def environment(rep, root):
     rep.section("Environment")
     rep("Nuke: %s" % getattr(nuke, "NUKE_VERSION_STRING", "?"))
-    flags = ["%s=%s" % (key, env_flag(key)) for key in ("nukex", "studio", "hiero", "ple", "indie", "gui")]
-    rep("Licence flags: " + ", ".join(flags))
+    rep("Licence flags: " + ", ".join(
+        "%s=%s" % (key, env_flag(key)) for key in ("nukex", "studio", "hiero", "ple", "indie", "gui")))
     rep("OS: %s | Python %s" % (platform.platform(), sys.version.split()[0]))
     rep("BlinkFlare folder: %s" % root)
     kernel = os.path.join(root, KERNEL_REL)
@@ -424,15 +330,33 @@ def environment(rep, root):
     except Exception:
         pass
     loaded = sys.modules.get("blinkflare")
-    if loaded is not None:
+    if loaded is not None and getattr(loaded, "__file__", None):
         where = os.path.dirname(os.path.dirname(os.path.abspath(loaded.__file__)))
         rep("blinkflare package already imported from: %s" % where)
         if os.path.normcase(where) != os.path.normcase(root):
-            rep.problem("Nuke has a different BlinkFlare copy loaded (%s). Remove the old "
+            rep.problem("Nuke had a different BlinkFlare copy loaded (%s). Remove the old "
                         "pluginAddPath line, or make it point here." % where)
     if not (env_flag("nukex") or env_flag("studio")):
         rep.problem("This doesn't look like NukeX or Nuke Studio. Plain Nuke can run BlinkScript "
                     "nodes but can't compile kernels; build the node on a NukeX seat (Save ToolSet).")
+
+
+def import_package(rep, root):
+    """Import this folder's copy of the package (fresh, in case it changed)."""
+    if root not in sys.path:
+        sys.path.insert(0, root)
+    for name in list(sys.modules):
+        if name == "blinkflare" or name.startswith("blinkflare."):
+            del sys.modules[name]
+    try:
+        import blinkflare
+        from blinkflare import builder, compiling
+    except Exception:
+        rep.problem("Importing the blinkflare package failed:")
+        rep(traceback.format_exc())
+        return None
+    rep("blinkflare package v%s imported from %s" % (blinkflare.VERSION, root))
+    return blinkflare, builder, compiling
 
 
 def blinkscript_knobs(rep):
@@ -452,57 +376,6 @@ def blinkscript_knobs(rep):
                 rep.problem("BlinkScript has no '%s' knob in this Nuke version." % needed)
     finally:
         nuke.delete(node)
-
-
-def run_probes(rep):
-    rep.section("Test kernels")
-    all_ok = True
-    for title, param, source in PROBES:
-        r = try_compile(source, param)
-        if r.ok:
-            rep("ok    %s  (compiled via '%s'; param knob named %r)" % (title, r.step, r.knob))
-        else:
-            all_ok = False
-            rep("FAIL  %s  (node in error: %s; new knobs: %s; errors: %s)"
-                % (title, r.in_error, r.new_knobs or "none", r.errors or "none"))
-    if not all_ok:
-        rep.problem("Some test kernels didn't compile from Python (see above).")
-    return all_ok
-
-
-def compile_blinkflare(rep, root):
-    rep.section("BlinkFlare kernel")
-    with open(os.path.join(root, KERNEL_REL)) as f:
-        source = f.read()
-    expected = len(re.findall(r"defineParam\(", source))
-    r = try_compile(source, FIRST_PARAM)
-    if r.ok:
-        rep("Compiled via '%s'. %d new knobs (kernel defines %d params); e.g. %r."
-            % (r.step, len(r.new_knobs), expected, r.knob))
-    else:
-        rep.problem("The BlinkFlare kernel did not compile (node in error: %s; errors: %s)."
-                    % (r.in_error, r.errors or "none"))
-    return r.ok, source
-
-
-def build_node(rep, root):
-    rep.section("Building a BlinkFlare node")
-    if root not in sys.path:
-        sys.path.insert(0, root)
-    for name in list(sys.modules):
-        if name == "blinkflare" or name.startswith("blinkflare."):
-            del sys.modules[name]  # make sure this copy is the one imported
-    try:
-        import blinkflare
-        for n in nuke.selectedNodes():
-            n.setSelected(False)
-        node = blinkflare.create()
-    except Exception:
-        rep.problem("blinkflare.create() failed:")
-        rep(traceback.format_exc())
-        return None
-    rep("Built %s (BlinkFlare v%s)." % (node.name(), blinkflare.VERSION))
-    return node
 
 
 def install_startup(rep, root):
@@ -539,25 +412,211 @@ def install_startup(rep, root):
         rep("Added the Nodes > Draw > BlinkFlare menu for this session.")
 
 
-def finish(rep):
-    path = report_path()
-    folder = os.path.dirname(path)
-    if not os.path.isdir(folder):
-        os.makedirs(folder)
-    with open(path, "w") as f:
-        f.write(rep.text())
-    copied = False
+def copy_to_clipboard(text):
     for module in ("PySide6", "PySide2"):
         try:
             widgets = __import__(module + ".QtWidgets", fromlist=["QtWidgets"])
-            app = widgets.QApplication.instance()
-            if app is not None:
-                app.clipboard().setText(rep.text())
-                copied = True
-            break
-        except Exception:
+        except ImportError:
             continue
-    where = "Report saved to %s%s." % (path, " and copied to the clipboard" if copied else "")
+        app = widgets.QApplication.instance()
+        if app is None:
+            return False
+        app.clipboard().setText(text)
+        return True
+    return False
+
+
+class Diagnostic(object):
+    """Runs the checks one at a time on Nuke's event loop.
+
+    Each step either finishes synchronously and calls next(), or starts a
+    background compile whose callback calls next(). Nothing waits in a loop.
+    """
+
+    def __init__(self, rep, root, package):
+        self.rep = rep
+        self.root = root
+        self.blinkflare, self.builder, self.compiling = package
+        self.progress = self.compiling.Progress("BlinkFlare check", "Starting...")
+        with open(os.path.join(root, KERNEL_REL)) as f:
+            self.source = f.read()
+        with nuke.root():
+            self.sandbox = nuke.nodes.Group(name="BlinkFlare_check")
+        self.steps = [self.step_basic, self.step_kernel]
+        self.kernel_ok = False
+        self.basic_ok = False
+        self.culprits = []
+        self.built = None
+
+    # -- driving
+    def start(self):
+        self.next()
+
+    def next(self):
+        if self.progress.cancelled():
+            self.rep("Cancelled.")
+            self.steps = []
+        if not self.steps:
+            self.compiling.later(0, self.finish)
+            return
+        step = self.steps.pop(0)
+        self.compiling.later(0, lambda: self.guard(step))
+
+    def guard(self, step):
+        try:
+            step()
+        except Exception:
+            self.rep.problem("A check failed unexpectedly:")
+            self.rep(traceback.format_exc())
+            self.next()
+
+    def compile(self, label, source, param, timeout, on_result, keep=False):
+        """Compile on a fresh test node; on_result(result, node); then next()."""
+        with self.sandbox:
+            node = nuke.nodes.BlinkScript()
+            if node.knob("useGPUIfAvailable") is not None:
+                node["useGPUIfAvailable"].setValue(False)
+        self.progress.text(label)
+        self.rep("compiling: %s" % label)
+
+        def done(result):
+            try:
+                on_result(result, node)
+            except Exception:
+                self.rep.problem("Handling the compile result failed:")
+                self.rep(traceback.format_exc())
+            if not keep:
+                try:
+                    nuke.delete(node)
+                except Exception:
+                    pass
+            self.next()
+
+        self.compiling.compile_async(node, source, param, done, timeout=timeout,
+                                     progress=self.progress, label=label)
+
+    # -- steps
+    def step_basic(self):
+        self.rep.section("Test kernel")
+
+        def result(r, node):
+            self.basic_ok = r.ok
+            if r.ok:
+                self.rep("ok    basic kernel: %s" % r.describe())
+            else:
+                self.rep("FAIL  basic kernel: %s" % r.describe())
+                self.rep.problem("Even a minimal test kernel didn't compile from Python.")
+        self.compile("basic test kernel", PROBES[0][2], PROBES[0][1], PROBE_TIMEOUT, result)
+
+    def step_kernel(self):
+        self.rep.section("BlinkFlare kernel")
+
+        def result(r, node):
+            self.kernel_ok = r.ok
+            if r.ok:
+                self.rep("ok    BlinkFlare kernel: %s" % r.describe())
+                self.steps.insert(0, lambda: self.step_build(node))
+            else:
+                self.rep.problem("The BlinkFlare kernel did not compile: %s" % r.describe())
+                if self.basic_ok:
+                    self.steps[0:0] = [self.step_probes, self.step_bisect]
+        self.compile("BlinkFlare kernel", self.source, FIRST_PARAM, KERNEL_TIMEOUT, result, keep=True)
+
+    def step_build(self, node):
+        self.rep.section("Building a BlinkFlare node")
+        for n in nuke.selectedNodes():
+            n.setSelected(False)
+        errors = []
+        try:
+            group = self.builder.create_from_kernel(node, on_error=errors.append)
+        except Exception:
+            errors.append(traceback.format_exc())
+            group = None
+        if group is not None:
+            self.built = group
+            self.rep("Built %s; the compiled kernel is cached, so new BlinkFlare nodes are "
+                     "instant from now on." % group.name())
+        else:
+            self.rep.problem("Building the node failed:")
+            for e in errors:
+                self.rep(e)
+        try:
+            nuke.delete(node)
+        except Exception:
+            pass
+        self.next()
+
+    def step_probes(self):
+        self.rep.section("More test kernels")
+        pending = list(PROBES[1:])
+
+        def run_next():
+            if not pending:
+                return self.next()
+            title, param, source = pending.pop(0)
+
+            def result(r, node):
+                self.rep("%s  %s: %s" % ("ok  " if r.ok else "FAIL", title, r.describe()))
+                if not r.ok:
+                    self.rep.problem("Test kernel failed: " + title)
+            self.steps.insert(0, run_next)
+            self.compile(title, source, param, PROBE_TIMEOUT, result)
+        run_next()
+
+    def step_bisect(self):
+        self.rep.section("Which part of the kernel does Nuke reject?")
+        names = [n for n in kernel_functions(self.source) if n != "define"]
+
+        def base_result(r, node):
+            if not r.ok:
+                self.rep.problem("Nuke rejects the kernel even with every function emptied, so "
+                                 "the problem is in its declarations (inputs, params, locals) or define().")
+                return
+            self.rep("With every function emptied it compiles; checking functions one by one.")
+            self.steps[0:0] = [self.function_step(n) for n in names] + [self.step_culprits]
+        self.compile("kernel with all functions emptied", stub_functions(self.source, ()),
+                     FIRST_PARAM, PROBE_TIMEOUT, base_result)
+
+    def function_step(self, name):
+        def step():
+            def result(r, node):
+                if not r.ok:
+                    self.culprits.append(name)
+            self.compile("only %s kept" % name, stub_functions(self.source, (name,)),
+                         FIRST_PARAM, PROBE_TIMEOUT, result)
+        return step
+
+    def step_culprits(self):
+        if self.culprits:
+            self.rep.problem("Nuke rejects these kernel functions: " + ", ".join(self.culprits))
+            for m in FUNC_RE.finditer(self.source):
+                if m.group(2) in self.culprits:
+                    line = self.source.count("\n", 0, m.start()) + 1
+                    self.rep("  %s starts at line %d of BlinkFlare.blink" % (m.group(2), line))
+        else:
+            self.rep("Every function compiles on its own; the failure only shows up in combination.")
+        self.next()
+
+    def finish(self):
+        self.progress.close()
+        try:
+            nuke.delete(self.sandbox)
+        except Exception:
+            pass
+        if self.built is not None and not nuke.ask(
+                "BlinkFlare built fine. Keep the test node %s?" % self.built.name()):
+            nuke.delete(self.built)
+        try:
+            install_startup(self.rep, self.root)
+        except Exception:
+            self.rep.problem("Updating init.py / the menu failed:")
+            self.rep(traceback.format_exc())
+        done(self.rep)
+
+
+def done(rep):
+    copied = copy_to_clipboard(rep.text())
+    where = "Report saved to %s%s." % (rep.path, " and copied to the clipboard" if copied else "")
     rep("")
     rep(where)
     if rep.problems:
@@ -565,48 +624,24 @@ def finish(rep):
                      "\n\n" + where + "\nPlease send that report back.")
     else:
         nuke.message("BlinkFlare is installed and working.\n\n" + where)
-    return path
 
 
 def main():
-    rep = Report()
-    rep("BlinkFlare install / diagnostic")
     root = locate()
     if not root:
         nuke.message("Couldn't find BlinkFlare there. Pick the BlinkFlare folder (the one "
                      "containing blinkflare/kernel/BlinkFlare.blink), or that .blink file.")
         return None
+    rep = Report(report_path())
+    rep("BlinkFlare install / diagnostic")
     environment(rep, root)
-
-    task = nuke.ProgressTask("BlinkFlare diagnostic")
-    ok = False
-    source = ""
-    with nuke.root():
-        sandbox = nuke.nodes.Group(name="BlinkFlare_diagnostic")
-    try:
-        with sandbox:
-            task.setMessage("Inspecting BlinkScript")
-            blinkscript_knobs(rep)
-            task.setMessage("Compiling test kernels")
-            task.setProgress(20)
-            run_probes(rep)
-            task.setMessage("Compiling BlinkFlare")
-            task.setProgress(50)
-            ok, source = compile_blinkflare(rep, root)
-            if not ok:
-                bisect(rep, source, task)
-    except Exception:
-        rep.problem("The diagnostic itself failed:")
-        rep(traceback.format_exc())
-    finally:
-        nuke.delete(sandbox)
-        del task
-
-    node = build_node(rep, root) if ok else None
-    if node is not None and not nuke.ask("BlinkFlare built fine. Keep the test node %s?" % node.name()):
-        nuke.delete(node)
-    install_startup(rep, root)
-    return finish(rep)
+    package = import_package(rep, root)
+    if package is None:
+        done(rep)
+        return rep.path
+    blinkscript_knobs(rep)
+    Diagnostic(rep, root, package).start()
+    return rep.path
 
 
 if __name__ == "__main__":

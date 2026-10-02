@@ -11,7 +11,27 @@ import nuke_expr
 
 sys.modules["nuke"] = fake_nuke
 
-from blinkflare import builder, camera, presets, spec  # noqa: E402
+from blinkflare import builder, camera, compiling, presets, spec  # noqa: E402
+
+
+class FakeClock(object):
+    """Stands in for time: compiling.sleep advances it instantly."""
+
+    def __init__(self):
+        self.now = 0.0
+
+    def time(self):
+        return self.now
+
+    def sleep(self, seconds):
+        self.now += seconds
+
+
+def use_fake_time():
+    clock = FakeClock()
+    compiling.clock = clock.time
+    compiling.sleep = clock.sleep
+    return clock
 
 CHANNEL_NAMES = {
     fake_nuke.XY_Knob: "xy", fake_nuke.XYZ_Knob: "xyz", fake_nuke.Color_Knob: "rgb",
@@ -25,8 +45,11 @@ class BuilderBase(unittest.TestCase):
         self.env = dict(os.environ)
         os.environ["BLINKFLARE_PRESET_SAVE_DIR"] = os.path.join(self.tmp.name, "personal")
         os.environ["BLINKFLARE_PRESET_PATH"] = ""
+        os.environ["BLINKFLARE_CACHE_DIR"] = os.path.join(self.tmp.name, "cache")
+        self.clock = use_fake_time()
         fake_nuke.reset(fake_nuke.Format(2048, 858, 2.0))
-        self.group = builder.create()
+        self.errors = []
+        self.group = builder.create(on_error=self.errors.append)
         self.blink = self.group.child(spec.KERNEL_NODE)
         self.proj = self.group.child(camera.PROJECTION_NODE)
 
@@ -126,57 +149,133 @@ class GraphTest(BuilderBase):
         self.assertNotIn(fake_nuke.STARTLINE, self.group["center_light"].flags)
         self.assertIn(fake_nuke.STARTLINE, self.group["glow_enable"].flags)
 
-    def test_failed_compile_cleans_up(self):
-        original = builder.compile_kernel
+    def fresh(self):
+        """Start over with no cached kernel."""
+        fake_nuke.reset()
+        for name in os.listdir(compiling.cache_dir()):
+            os.remove(os.path.join(compiling.cache_dir(), name))
 
-        def broken(blink):
-            raise builder.BuildError("no NukeX")
-        builder.compile_kernel = broken
-        try:
-            before = len(fake_nuke.root().children())
-            with self.assertRaises(builder.BuildError):
-                builder.create()
-            self.assertEqual(len(fake_nuke.root().children()), before)
-        finally:
-            builder.compile_kernel = original
+    def groups(self):
+        return [n.name() for n in fake_nuke.root().children() if n.Class() == "Group"]
 
-    def test_compile_falls_back_when_recompile_is_deferred(self):
-        for trigger in ("validate", "file"):
-            fake_nuke.reset()
-            fake_nuke.BLINK_COMPILE_ON = {trigger}
-            group = builder.create()
-            kernel = group.child(spec.KERNEL_NODE)
-            self.assertIsNotNone(builder.param_knob_name(kernel, "lightPos"), trigger)
-            self.assertEqual(kernel["kernelSourceFile"].value(), "", trigger)
+    def test_kernel_compiles_once_then_is_pasted(self):
+        self.assertEqual(fake_nuke.compile_count[0], 1)
+        self.assertTrue(os.path.isfile(compiling.template_path(builder.kernel_source())))
+        second = builder.create(on_error=self.errors.append)
+        self.assertEqual(fake_nuke.compile_count[0], 1)
+        self.assertIsNotNone(builder.param_knob_name(second.child(spec.KERNEL_NODE), "lightPos"))
+        self.assertEqual(self.errors, [])
+
+    def test_compile_holder_is_removed(self):
+        self.assertNotIn("BlinkFlare_compiling", self.groups())
+
+    def test_main_kernel_uses_gpu_after_cpu_only_compile(self):
+        self.assertEqual(fake_nuke.compile_gpu, [False])
+        self.assertTrue(self.blink["useGPUIfAvailable"].value())
+
+    def test_deferred_compile_is_waited_for(self):
+        self.fresh()
+        fake_nuke.BLINK_ASYNC_POLLS = 20
+        done = []
+        group = builder.create(on_done=done.append, on_error=self.errors.append)
+        self.assertEqual(done, [group])
+        self.assertIsNotNone(group)
+        self.assertGreater(self.clock.now, 1.0)  # waited on the timer, not by blocking
+        self.assertEqual(self.errors, [])
+
+    def test_load_from_file_fallback(self):
+        self.fresh()
+        fake_nuke.BLINK_COMPILE_ON = {"file"}
+        group = builder.create(on_error=self.errors.append)
+        self.assertIsNotNone(group, self.errors)
+        self.assertGreaterEqual(self.clock.now, compiling.FILE_FALLBACK_AFTER)
 
     def test_unprefixed_param_knobs_are_found(self):
-        fake_nuke.reset()
+        self.fresh()
         fake_nuke.BLINK_PREFIX = ""
-        kernel = builder.create().child(spec.KERNEL_NODE)
+        kernel = builder.create(on_error=self.errors.append).child(spec.KERNEL_NODE)
         self.assertEqual(builder.param_knob_name(kernel, "lightPos"), "lightPos")
 
-    def test_compile_failure_explains_itself(self):
-        fake_nuke.reset()
+    def test_rejected_kernel_reports_and_cleans_up(self):
+        self.fresh()
         fake_nuke.BLINK_REJECT.append("lfWrapPi")
-        with self.assertRaises(builder.BuildError) as ctx:
-            builder.create()
-        msg = str(ctx.exception)
-        self.assertIn("did not compile", msg)
-        self.assertIn("in error: True", msg)
-        self.assertIn("install_blinkflare.py", msg)
-        self.assertEqual([n for n in fake_nuke.root().children() if n.Class() == "Group"], [])
+        self.assertIsNone(builder.create(on_error=self.errors.append))
+        msg = self.errors[-1]
+        self.assertIn("did not compile: Nuke rejected the kernel", msg)
+        self.assertIn("node in error: True", msg)
+        self.assertLess(self.clock.now, compiling.ERROR_GRACE + 5)
+        self.assertIn("Check Install", msg)
+        self.assertIn("Build From Compiled BlinkScript", msg)
+        self.assertEqual(self.groups(), [])
+        self.assertFalse(os.path.exists(compiling.template_path(builder.kernel_source())))
 
     def test_compile_failure_mentions_licence(self):
-        fake_nuke.reset()
+        self.fresh()
         fake_nuke.env["nukex"] = False
         fake_nuke.BLINK_COMPILE_ON = set()
-        with self.assertRaises(builder.BuildError) as ctx:
-            builder.create()
-        self.assertIn("needs NukeX", str(ctx.exception))
+        builder.create(on_error=self.errors.append)
+        self.assertIn("needs NukeX", self.errors[-1])
+
+    def test_holder_deleted_by_user_while_compiling(self):
+        self.fresh()
+        fake_nuke.BLINK_COMPILE_ON = set()
+        original = compiling.later
+
+        def delete_then_wait(ms, fn):
+            holder = fake_nuke.toNode("root.BlinkFlare_compiling")
+            if holder is not None:
+                fake_nuke.delete(holder)
+            compiling.later = original
+            original(ms, fn)
+        compiling.later = delete_then_wait
+        try:
+            builder.create(on_error=self.errors.append)
+        finally:
+            compiling.later = original
+        self.assertIn("did not compile", self.errors[-1])
+
+    def test_stale_cached_kernel_is_recompiled(self):
+        path = compiling.template_path(builder.kernel_source())
+        with open(path, "w") as f:
+            f.write('[{"class": "BlinkScript", "name": "Old", "knobs": {}, "params": []}]')
+        group = builder.create(on_error=self.errors.append)
+        self.assertIsNotNone(group, self.errors)
+        self.assertEqual(fake_nuke.compile_count[0], 2)
+
+    def test_build_from_hand_compiled_node(self):
+        self.fresh()
+        node = fake_nuke.nodes.BlinkScript(name="MyKernel")
+        node["kernelSource"].setValue(builder.kernel_source())
+        node["recompile"].execute()
+        group = builder.create_from_kernel(node, on_error=self.errors.append)
+        self.assertIsNotNone(group, self.errors)
+        self.assertEqual(fake_nuke.compile_count[0], 1)  # only the hand compile
+        self.assertTrue(os.path.isfile(compiling.template_path(builder.kernel_source())))
+
+    def test_build_from_wrong_node_explains(self):
+        for node in (None, fake_nuke.nodes.Dot(), fake_nuke.nodes.BlinkScript()):
+            with self.assertRaises(builder.BuildError):
+                builder.create_from_kernel(node)
+
+    def test_build_errors_are_reported_not_raised(self):
+        fake_nuke.reset()
+        original = builder.add_group_knobs
+
+        def broken(group, fmt):
+            raise RuntimeError("boom")
+        builder.add_group_knobs = broken
+        try:
+            self.assertIsNone(builder.create(on_error=self.errors.append))
+        finally:
+            builder.add_group_knobs = original
+        self.assertIn("boom", self.errors[-1])
+        self.assertEqual(self.groups(), [])
 
     def test_save_toolset(self):
         path = builder.save_toolset(os.path.join(self.tmp.name, "ToolSets", "BlinkFlare.nk"))
         self.assertTrue(os.path.exists(path))
+        with open(path) as f:
+            self.assertIn('"class": "Group"', f.read())
         self.assertNotIn("BlinkFlare2", [n.name() for n in fake_nuke.root().children()])
 
 
