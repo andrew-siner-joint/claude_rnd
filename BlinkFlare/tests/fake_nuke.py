@@ -6,9 +6,15 @@ creates its param knobs by parsing the kernel source, like Nuke does on
 compile.
 """
 import json
+import math
 import re
 
+import nuke_expr
+
 STARTLINE = 0x1000
+TABBEGINGROUP = 1
+TABBEGINCLOSEDGROUP = 2
+TABENDGROUP = -1
 GUI = False
 NUKE_VERSION_STRING = "15.1v3 (fake)"
 env = {"nukex": True}
@@ -55,6 +61,7 @@ class Knob(object):
         self.link = None
         self.node = None
         self.keys = {}  # channel -> {frame: value}
+        self.visible = True
 
     def name(self):
         return self._name
@@ -110,6 +117,24 @@ class Knob(object):
 
     def setTooltip(self, text):
         self.tooltip = text
+
+    def setVisible(self, state):
+        self.visible = bool(state)
+
+    def setLabel(self, text):
+        self.label = text
+
+    def toScript(self):
+        return json.dumps({"values": self.values, "keys": dict((str(c), dict((str(f), v) for f, v in k.items()))
+                                                             for c, k in self.keys.items()),
+                           "expressions": dict((str(c), e) for c, e in self.expressions.items())})
+
+    def fromScript(self, text):
+        data = json.loads(text)
+        self.values = list(data["values"])
+        self.keys = dict((int(c), dict((float(f), v) for f, v in k.items())) for c, k in data["keys"].items())
+        self.expressions = dict((int(c), e) for c, e in data["expressions"].items())
+        self.animated = bool(self.keys)
 
     def setFlag(self, flag):
         self.flags.add(flag)
@@ -173,7 +198,9 @@ class String_Knob(Knob):
 
 
 class Tab_Knob(Knob):
-    pass
+    def __init__(self, name, label="", flag=0):
+        Knob.__init__(self, name, label)
+        self.flag = flag
 
 
 class Text_Knob(Knob):
@@ -224,6 +251,10 @@ class PyScript_Knob(Knob):
             self.node._trigger("file")
 
 
+class File_Knob(String_Knob):
+    pass
+
+
 class Link_Knob(Knob):
     def setLink(self, target):
         self.link = target
@@ -244,6 +275,8 @@ CLASS_KNOBS = {
     "Group": {"tile_color": Int_Knob, "knobChanged": String_Knob},
     "Dot": {},
     "NoOp": {},
+    "Constant": {"color": AColor_Knob},
+    "Expression": dict(("expr%d" % i, String_Knob) for i in range(4)),
     "Axis2": AXIS_KNOBS,
     "Camera2": dict(AXIS_KNOBS, focal=Double_Knob, haperture=Double_Knob, winroll=Double_Knob,
                     win_translate=XY_Knob, win_scale=XY_Knob),
@@ -273,11 +306,14 @@ CLASS_KNOBS = {
                "output": String_Knob, "mix": Double_Knob, "invert_mask": Boolean_Knob,
                "maskChannelMask": String_Knob},
     "Switch": {"which": Double_Knob},
+    "Transform": {"scale": Double_Knob, "center": XY_Knob,
+                  "filter": _enum(["Impulse", "Cubic", "Keys", "Simon", "Rifman"])},
     "Root": {},
 }
 MAX_INPUTS = {"Input": 0, "Output": 1, "Multiply": 1, "AddChannels": 1, "Crop": 1,
               "Reformat": 1, "BlinkScript": 1, "Merge2": 10, "Switch": 10, "Root": 0,
-              "Dot": 1, "NoOp": 1, "Axis2": 1, "Camera2": 1, "TimeBlur": 1, "Copy": 2}
+              "Dot": 1, "NoOp": 1, "Axis2": 1, "Camera2": 1, "TimeBlur": 1, "Copy": 2,
+              "Constant": 0, "Expression": 1, "Transform": 1}
 NO_DISABLE = ("Root", "Input", "Output", "Group")
 
 _root = None
@@ -288,6 +324,19 @@ _this_knob = None
 _layers = ["rgba", "depth"]
 inputs_queue = []
 messages = []
+# Which output channel each Expression node exprN writes (Nuke's defaults:
+# expr0 red ... expr3 alpha); tests change it to simulate other setups.
+EXPRESSION_CHANNELS = [0, 1, 2, 3]
+RGBA_NAMES = ("red", "green", "blue", "alpha")
+
+
+def _knob_number(knob, channel=None):
+    """A knob's value as a Nuke expression sees it."""
+    if isinstance(knob, Enumeration_Knob):
+        return knob.getValue()
+    if channel is not None:
+        return float(knob.value("rgb".index(channel)))
+    return float(knob.value())
 
 
 class Node(object):
@@ -339,6 +388,49 @@ class Node(object):
             raise ValueError("duplicate knob %r" % knob.name())
         self._add(knob)
         self.user_knob_order.append(knob.name())
+
+    # pixels (just enough to read back BlinkFlare's element table)
+    def sample(self, channel, x, y, dx=1.0, dy=1.0, frame=None):
+        return self._pixel(int(math.floor(x)), int(math.floor(y)))[
+            RGBA_NAMES.index(channel.split(".")[-1])]
+
+    def _pixel(self, px, py):
+        if self._class == "Constant":
+            return [float(v) for v in self["color"].values]
+        if self._class == "Crop":
+            b = self["box"].values
+            if b[0] <= px < b[2] and b[1] <= py < b[3]:
+                return self.input(0)._pixel(px, py)
+            return [0.0] * 4
+        if self._class == "Transform":
+            assert self["filter"].value() == "Impulse"
+            s = self["scale"].value()
+            cx, cy = self["center"].values
+            return self.input(0)._pixel(int(math.floor((px + 0.5 - cx) / s + cx)),
+                                        int(math.floor((py + 0.5 - cy) / s + cy)))
+        if self._class == "Expression":
+            prev = self.input(0)._pixel(px, py)
+            env = {"x": float(px), "y": float(py)}
+            env.update(zip("rgba", prev))
+
+            def resolve(path):
+                if path in env:
+                    return env[path]
+                parts = path.split(".")
+                target = self._parent if parts[0] == "parent" else self._parent.node(parts[0])
+                return _knob_number(target[parts[1]], parts[2] if len(parts) > 2 else None)
+            out = list(prev)
+            for i in range(4):
+                out[EXPRESSION_CHANNELS[i]] = nuke_expr.evaluate(self["expr%d" % i].value(), resolve)
+            return out
+        raise RuntimeError("fake nuke can't compute pixels of a %s" % self._class)
+
+    def removeKnob(self, knob):
+        name = knob.name()
+        if self._knobs.get(name) is not knob:
+            raise ValueError("knob %r is not on %s" % (name, self._name))
+        del self._knobs[name]
+        self.user_knob_order.remove(name)
 
     @property
     def user_knob_order(self):
@@ -420,6 +512,9 @@ class Node(object):
         pass
 
     def children(self):
+        return list(self._children)
+
+    def nodes(self):
         return list(self._children)
 
     def child(self, name):
@@ -508,6 +603,8 @@ def reset(fmt=None):
     del _selected[:]
     del inputs_queue[:]
     del messages[:]
+    EXPRESSION_CHANNELS[:] = [0, 1, 2, 3]
+    Undo._disabled[0] = False
     _layers[:] = ["rgba", "depth"]
     root()._format = fmt or Format(1920, 1080)
     root()._add(Int_Knob("first_frame"))
@@ -696,6 +793,19 @@ def nodePaste(path):
 
 class Undo(object):
     log = []
+    _disabled = [False]
+
+    def disable(self):
+        assert not Undo._disabled[0], "nested Undo.disable"
+        Undo._disabled[0] = True
+        Undo.log.append(("disable", ""))
+
+    def enable(self):
+        Undo._disabled[0] = False
+        Undo.log.append(("enable", ""))
+
+    def disabled(self):
+        return Undo._disabled[0]
 
     def begin(self, name=""):
         Undo.log.append(("begin", name))

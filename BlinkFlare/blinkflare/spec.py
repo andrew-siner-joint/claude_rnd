@@ -4,9 +4,12 @@ Pure data with no Nuke import, so the builder, the tests and the preview
 renderer all share one definition. Each knob that maps 1:1 onto a kernel
 parameter names it in ``blink``; parameters that need an expression are listed
 in ``DERIVED_PARAMS``.
+
+These are the node's fixed knobs. The flare elements themselves are added
+and removed at runtime (see elements.py and builder.py).
 """
 
-from blinkflare import camera
+from blinkflare import camera, elements
 
 KERNEL_NAME = "BlinkFlareKernel"
 KERNEL_NODE = "FlareKernel"
@@ -14,19 +17,13 @@ MERGE_NODE = "Composite"
 SWITCH_NODE = "OutputSwitch"
 MOTION_BLUR_NODE = "MotionBlur"
 
-VERSION = "2.0.0"
+VERSION = "3.0.0"
 
-# Element index (kernel soloElement) and the layer it is written to when
-# Element Layers is on.
-ELEMENTS = [
-    (1, "glow", "flare_glow"),
-    (2, "glints", "flare_glints"),
-    (3, "streaks", "flare_streaks"),
-    (4, "ring", "flare_ring"),
-    (5, "ghosts", "flare_ghosts"),
-    (6, "spectral", "flare_spectral"),
-    (7, "dirt", "flare_dirt"),
-]
+# Render passes (kernel soloPass) and the layers Element Layers writes.
+PASSES = elements.PASSES
+
+# Kernel params the builder sets directly (from the element stack).
+BUILDER_PARAMS = ("elementCount",)
 
 
 class Knob(object):
@@ -92,6 +89,10 @@ CENTER_LIGHT_SCRIPT = (
     "n['light_pos'].setValue([n.width() * 0.5, n.height() * 0.5])\n"
 )
 APPLY_PRESET_SCRIPT = "import blinkflare\nblinkflare.apply_preset(nuke.thisNode())\n"
+ADD_SCRIPT = ("import blinkflare\nn = nuke.thisNode()\n"
+              "blinkflare.add_element(n, n['add_type'].value())\n")
+CLEAR_SCRIPT = ("import blinkflare\nif nuke.ask('Remove every element?'):\n"
+                "    blinkflare.clear_elements(nuke.thisNode())\n")
 SAVE_PRESET_SCRIPT = "import blinkflare\nblinkflare.save_preset(nuke.thisNode())\n"
 BAKE_SCRIPT = "import blinkflare\nblinkflare.bake_to_2d(nuke.thisNode())\n"
 
@@ -137,12 +138,6 @@ KNOBS = [
     boolean("spin_with_light", "Rotate With Light", False, "spinWithLight",
             tooltip="Lock the glint and spectral streak rotation to the flare axis, so "
                     "they turn as the light orbits the articulation point."),
-    dbl("element_aspect", "Element Aspect", 1.0, 0.25, 4.0, "elementAspect",
-        tooltip="Horizontal stretch of round elements (glow, ring, ghosts). Values "
-                "below 1 give the tall oval ghosts of anamorphic lenses."),
-    dbl("pixel_aspect", "Pixel Aspect", 1.0, 0.5, 2.0, "pixelAspect",
-        tooltip="Pixel aspect of the plate so elements stay round in the viewer. "
-                "Set automatically when the node is created."),
 
     divider("div_visibility", "Visibility"),
     dbl("offscreen_fade", "Off-screen Fade", 0.5, 0.0, 1.0, "offscreenFade",
@@ -199,115 +194,38 @@ KNOBS = [
                  "studio preset folders)."),
     text("version_info", "BlinkFlare v" + VERSION),
 
-    # ------------------------------------------------------------------- Glow
-    tab("tab_glow", "Glow"),
-    boolean("glow_enable", "Enable Glow", True, "glowEnable"),
-    dbl("glow_intensity", "Intensity", 0.5, 0.0, 2.0, "glowIntensity"),
-    dbl("glow_size", "Size", 0.1, 0.0, 0.5, "glowSize",
-        tooltip="Radius of the soft glow, in frame heights."),
-    dbl("glow_falloff", "Falloff", 1.0, 0.2, 4.0, "glowFalloff",
-        tooltip="How quickly the glow fades. Low values leave a long haze across the "
-                "frame; high values keep it tight."),
-    color("glow_color", "Color", (1.0, 0.82, 0.62), "glowColor"),
-    divider("div_core", "Hot Core"),
-    dbl("core_intensity", "Intensity", 4.0, 0.0, 20.0, "coreIntensity"),
-    dbl("core_size", "Size", 0.012, 0.0, 0.1, "coreSize"),
-    color("core_color", "Color", (1.0, 0.97, 0.92), "coreColor"),
-
-    # ----------------------------------------------------------------- Glints
-    tab("tab_glints", "Glints"),
-    boolean("glint_enable", "Enable Glints", True, "glintEnable"),
-    dbl("glint_intensity", "Intensity", 0.6, 0.0, 4.0, "glintIntensity"),
-    integer("glint_count", "Rays", 12, "glintCount", tooltip="Number of main rays (1-256)."),
-    dbl("glint_length", "Length", 0.3, 0.0, 1.5, "glintLength",
-        tooltip="Length of the longest rays, in frame heights."),
-    dbl("glint_length_random", "Length Random", 0.6, 0.0, 0.95, "glintLengthRandom"),
-    dbl("glint_width", "Width", 2.0, 0.0, 10.0, "glintWidth",
-        tooltip="Ray thickness at the base, in thousandths of the frame height."),
-    dbl("glint_rotation", "Rotation", 0.0, -180.0, 180.0, "glintRotation"),
-    dbl("glint_fine", "Fine Rays", 0.4, 0.0, 2.0, "glintFine",
-        tooltip="Adds a layer of shorter, thinner rays between the main ones."),
-    integer("glint_seed", "Seed", 1, "glintSeed"),
-    color("glint_color", "Color", (1.0, 0.9, 0.78), "glintColor"),
-
-    # ---------------------------------------------------------------- Streaks
-    tab("tab_streaks", "Streaks"),
-    boolean("streak_enable", "Enable Streaks", True, "streakEnable"),
-    dbl("streak_intensity", "Intensity", 0.6, 0.0, 4.0, "streakIntensity"),
-    integer("streak_count", "Count", 1, "streakCount",
-            tooltip="1 is the classic anamorphic line, 2 a cross, more a star (1-16)."),
-    dbl("streak_length", "Length", 0.9, 0.0, 3.0, "streakLength",
-        tooltip="Half-length of each streak, in frame heights."),
-    dbl("streak_thickness", "Thickness", 2.0, 0.0, 10.0, "streakThickness",
-        tooltip="Core thickness, in thousandths of the frame height."),
-    dbl("streak_angle", "Angle", 0.0, -180.0, 180.0, "streakAngle"),
-    dbl("streak_glow", "Glow", 0.8, 0.0, 2.0, "streakGlow",
-        tooltip="Soft haze around the streak core."),
-    color("streak_color", "Color", (0.55, 0.75, 1.0), "streakColor"),
-
-    # ------------------------------------------------------------------- Ring
-    tab("tab_ring", "Ring"),
-    boolean("ring_enable", "Enable Ring", True, "ringEnable"),
-    dbl("ring_intensity", "Intensity", 0.05, 0.0, 1.0, "ringIntensity"),
-    dbl("ring_radius", "Radius", 0.25, 0.0, 1.0, "ringRadius",
-        tooltip="Ring radius in frame heights."),
-    dbl("ring_thickness", "Thickness", 0.025, 0.0, 0.2, "ringThickness"),
-    dbl("ring_spectral", "Spectral", 0.8, 0.0, 1.0, "ringSpectral",
-        tooltip="Blend from a plain ring to a rainbow halo."),
-    dbl("ring_axis_pos", "Axis Position", 0.0, -1.0, 3.0, "ringAxisPos",
-        tooltip="Where the ring sits on the flare axis: 0 around the light, 1 on the "
-                "articulation point, 2 mirrored to the far side."),
-    dbl("ring_arc", "Arc", 0.0, 0.0, 1.0, "ringArc",
-        tooltip="Fades the ring into a partial arc (hoop) facing along the flare axis."),
-    dbl("ring_arc_rotation", "Arc Rotation", 0.0, -180.0, 180.0, "ringArcRotation"),
-    color("ring_color", "Color", (1.0, 1.0, 1.0), "ringColor"),
-
-    # ----------------------------------------------------------------- Ghosts
-    tab("tab_ghosts", "Ghosts"),
-    boolean("ghost_enable", "Enable Ghosts", True, "ghostEnable"),
-    dbl("ghost_intensity", "Intensity", 0.12, 0.0, 1.0, "ghostIntensity"),
-    integer("ghost_count", "Count", 9, "ghostCount", tooltip="Number of ghosts (0-64)."),
-    integer("ghost_seed", "Seed", 1, "ghostSeed"),
-    dbl("ghost_size", "Size", 0.06, 0.0, 0.3, "ghostSize",
-        tooltip="Radius of the largest ghosts, in frame heights."),
-    dbl("ghost_size_random", "Size Random", 0.7, 0.0, 0.95, "ghostSizeRandom"),
-    dbl("ghost_spread_min", "Axis Start", 0.3, -1.0, 3.0, "ghostSpreadMin",
-        tooltip="Ghosts are scattered along the axis between Start and End. "
-                "0 = light, 1 = articulation point, 2 = mirrored."),
-    dbl("ghost_spread_max", "Axis End", 2.1, -1.0, 3.0, "ghostSpreadMax"),
-    integer("ghost_blades", "Aperture Blades", 6, "ghostBlades",
-            tooltip="Polygon sides of the iris shape. Below 3 gives round ghosts."),
-    dbl("ghost_roundness", "Roundness", 0.25, 0.0, 1.0, "ghostRoundness"),
-    dbl("ghost_rotation", "Blade Rotation", 0.0, -180.0, 180.0, "ghostRotation"),
-    dbl("ghost_softness", "Softness", 0.08, 0.0, 1.0, "ghostSoftness"),
-    dbl("ghost_hollow", "Hollow", 0.35, 0.0, 1.0, "ghostHollow",
-        tooltip="Darkens the ghost centers so they read as rings."),
-    dbl("ghost_chroma", "Chromatic Fringe", 0.04, -0.5, 0.5, "ghostChroma",
-        tooltip="Red/blue fringing on ghost edges. Negative flips the order."),
-    dbl("ghost_hue_random", "Hue Random", 0.5, 0.0, 1.0, "ghostHueRandom"),
-    dbl("ghost_intensity_random", "Intensity Random", 0.6, 0.0, 1.0, "ghostIntensityRandom"),
-    color("ghost_color", "Color", (1.0, 0.95, 0.85), "ghostColor"),
-
-    # --------------------------------------------------------------- Spectral
-    tab("tab_spectral", "Spectral"),
-    boolean("spectral_enable", "Enable Spectral Streaks", True, "spectralEnable"),
-    dbl("spectral_intensity", "Intensity", 0.4, 0.0, 2.0, "spectralIntensity"),
-    integer("spectral_count", "Count", 12, "spectralCount", tooltip="Number of streaks (0-64)."),
-    integer("spectral_seed", "Seed", 1, "spectralSeed"),
-    dbl("spectral_length", "Length", 0.04, 0.0, 0.3, "spectralLength",
-        tooltip="Half-length of each streak, in frame heights."),
-    dbl("spectral_width", "Width", 1.5, 0.0, 10.0, "spectralWidth",
-        tooltip="Thickness in thousandths of the frame height."),
-    dbl("spectral_offset", "Distance", 0.06, 0.0, 0.5, "spectralOffset",
-        tooltip="Distance from the light to the nearest streaks."),
-    dbl("spectral_spread", "Distance Random", 0.05, 0.0, 0.5, "spectralSpread"),
-    dbl("spectral_orient", "Orientation", 0.0, 0.0, 1.0, "spectralOrient",
-        tooltip="0 points the streaks at the light; 1 curves them into rainbow arcs "
-                "around it."),
-    dbl("spectral_random", "Randomness", 0.7, 0.0, 1.0, "spectralRandom"),
-
-    # ------------------------------------------------------------------- Dirt
-    tab("tab_dirt", "Dirt"),
+    # ------------------------------------------------------------------- Lens
+    tab("tab_lens", "Lens"),
+    text("lens_info", "One lens behind every element: its aperture shapes the ghosts and "
+                      "the starburst spikes, its coatings colour the ghosts."),
+    divider("div_aperture", "Aperture"),
+    integer("aperture_blades", "Blades", 6, "apertureBlades",
+            tooltip="Aperture blades. Ghosts take this polygon shape; a starburst gets one "
+                    "spike per blade (two for odd counts). Below 3 is round."),
+    dbl("aperture_roundness", "Roundness", 0.2, 0.0, 1.0, "apertureRoundness",
+        tooltip="Curved blades: 0 is a sharp polygon, 1 a circle."),
+    dbl("aperture_rotation", "Rotation", 0.0, -180.0, 180.0, "apertureRotation"),
+    dbl("anamorphic", "Anamorphic Squeeze", 1.0, 0.25, 2.0, "anamorphic",
+        tooltip="Horizontal scale of round elements. Below 1 gives the tall oval ghosts "
+                "and bokeh of anamorphic lenses (0.5 for a 2x squeeze)."),
+    dbl("pixel_aspect", "Pixel Aspect", 1.0, 0.5, 2.0, "pixelAspect",
+        tooltip="Pixel aspect of the plate so elements stay round in the viewer. "
+                "Set automatically when the node is created."),
+    divider("div_glass", "Glass"),
+    dbl("dispersion", "Dispersion", 1.0, 0.0, 3.0, "dispersion",
+        tooltip="Scales every element's colour fringing and spectral spread."),
+    dbl("dust", "Dust", 0.3, 0.0, 2.0, "dust",
+        tooltip="Mottled texture and bright specks inside ghosts."),
+    dbl("barrel_clip", "Barrel Clip", 0.5, 0.0, 2.0, "barrelClip",
+        tooltip="Cat's-eye clipping of ghosts by the lens barrel. It grows as the light "
+                "moves away from the centre, as with real optical vignetting."),
+    divider("div_coatings", "Coatings"),
+    color("coating_a", "Coating A", (1.0, 0.45, 0.85), "coatingA",
+          tooltip="Ghost Set elements pick their colours from these three (see each "
+                  "element's Coating Mix). Typical coatings reflect magenta, green and amber."),
+    color("coating_b", "Coating B", (0.45, 1.0, 0.55), "coatingB"),
+    color("coating_c", "Coating C", (1.0, 0.7, 0.3), "coatingC"),
+    divider("div_dirt", "Lens Dirt"),
     text("dirt_info", "Connect a lens dirt / smudge texture to the 'dirt' input."),
     boolean("dirt_enable", "Enable Dirt", False, "dirtEnable"),
     dbl("dirt_intensity", "Intensity", 1.0, 0.0, 4.0, "dirtIntensity"),
@@ -315,6 +233,7 @@ KNOBS = [
         tooltip="Radius around the light where the dirt is lit, in frame heights."),
     dbl("dirt_response", "Flare Response", 1.0, 0.0, 4.0, "dirtResponse",
         tooltip="How much the flare elements themselves light up the dirt."),
+    color("dirt_color", "Color", (1.0, 0.85, 0.7), "dirtColor"),
 
     # --------------------------------------------------------------------- 3D
     tab("tab_3d", "3D"),
@@ -344,14 +263,15 @@ KNOBS = [
          tooltip="Dissolve between the source and the composite."),
     Knob("invert_mask", "link", "Invert Mask", link=MERGE_NODE + ".invert_mask",
          alts=("invertMask",), tooltip="Invert the 'mask' input."),
-    Knob("solo", "enum", "Solo", 0, "soloElement",
-         items=["All"] + [e[1].capitalize() for e in ELEMENTS],
-         tooltip="Show a single element while you tune it. Affects the render, so set "
-                 "it back to All."),
+    Knob("solo", "enum", "Solo", 0, "soloPass",
+         items=["All"] + [p[1] for p in PASSES],
+         tooltip="Show one render pass while you tune it (each element's Layer menu "
+                 "picks its pass). Affects the render, so set it back to All."),
     boolean("element_layers", "Element Layers", False,
-            tooltip="Also write each element to its own layer (flare_glow, "
-                    "flare_ghosts, ...) for grading downstream. Adds one kernel per "
-                    "element, so it is slower."),
+            tooltip="Also write each render pass to its own layer (flare_glow, "
+                    "flare_rays, flare_streaks, flare_ghosts, flare_rings, flare_other, "
+                    "flare_dirt) for grading downstream. Renders the flare once per pass, "
+                    "so it is slower."),
     Knob("render_region", "enum", "Render Region", 0, items=["Format", "Input BBox"],
          tooltip="Format renders the flare inside the frame. Input BBox renders it over "
                  "the whole input bounding box, for overscan comps."),
@@ -371,6 +291,17 @@ KNOBS = [
          tooltip="Run the kernel on the GPU (CUDA/Metal) when one is available."),
     Knob("vectorize", "link", "Vectorize on CPU", link=KERNEL_NODE + ".vectorize",
          alts=("vectorise",), newline=False, tooltip="Use SIMD on the CPU fallback path."),
+
+    # --------------------------------------------------------------- Elements
+    # Kept last: elements are added at runtime and Nuke appends new knobs to
+    # the end of the panel.
+    tab("tab_elements", "Elements"),
+    Knob("add_type", "enum", "New Element", 0, items=elements.TYPE_NAMES,
+         tooltip="Pick a type, then Add. Elements are additive, so their order doesn't "
+                 "change the image."),
+    Knob("add_element", "button", "Add", script=ADD_SCRIPT, newline=False),
+    Knob("clear_elements", "button", "Remove All", script=CLEAR_SCRIPT, newline=False),
+    text("elements_info", "Each element below opens to show its controls."),
 ]
 
 # Kernel params driven by expressions rather than a single group knob.
@@ -408,7 +339,7 @@ DERIVED_PARAMS = {
 # Knobs that describe placement, visibility or pipeline settings; presets
 # never touch them.
 NON_LOOK_KNOBS = {
-    "light_source", "light_pos", "articulation_mode", "axis_center", "pixel_aspect",
+    "light_source", "light_pos", "articulation_mode", "axis_center", "pixel_aspect", "add_type",
     "offscreen_fade", "occlusion_enable", "occlusion_mode", "occlusion_radius",
     "occlusion_samples", "occlusion_invert", "light_depth",
     "source_intensity", "source_color", "source_radius", "source_black", "source_white",

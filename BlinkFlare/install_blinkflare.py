@@ -315,6 +315,50 @@ def stub_functions(source, keep):
 
 # --------------------------------------------------------------- the checks
 
+TABLE_SCALE = 9  # table cells become 9x9 blocks, so sample() filtering can't mix them
+
+
+def check_table(rep, group):
+    """Read the node's element table back from Nuke and compare it with the
+    values Python encodes for the same knobs. This checks the parts that only
+    real Nuke can: Expression node channels, x/y, and parent knob references."""
+    from blinkflare import builder, elements, spec
+    want = elements.table(builder.stack(group))
+    blink = group.node(spec.KERNEL_NODE)
+    count = int(builder.param_knob(blink, "elementCount").value())
+    if count != len(want):
+        rep.problem("The kernel's elementCount is %d; the stack has %d table columns."
+                    % (count, len(want)))
+    if not want:
+        rep("element table: the stack is empty, nothing to compare")
+        return
+    with group:
+        probe = nuke.nodes.Transform(name="TableProbe",
+                                     inputs=[group.node("TableRow%d" % (elements.ROWS - 1))])
+    try:
+        probe["scale"].setValue(TABLE_SCALE)
+        probe["center"].setValue([0.0, 0.0])
+        probe["filter"].setValue("Impulse")
+        bad = []
+        for x, column in enumerate(want):
+            for r, row in enumerate(column):
+                for c, chan in enumerate(("red", "green", "blue", "alpha")):
+                    got = probe.sample("rgba." + chan, (x + 0.5) * TABLE_SCALE,
+                                       (r + 0.5) * TABLE_SCALE)
+                    if abs(got - row[c]) > 1e-4 * max(1.0, abs(row[c])):
+                        bad.append("column %d row %d %s: Nuke %.6g, expected %.6g"
+                                   % (x, r, chan, got, row[c]))
+    finally:
+        nuke.delete(probe)
+    cells = len(want) * elements.ROWS * 4
+    if bad:
+        rep.problem("The element table Nuke computes differs from the expected values in "
+                    "%d of %d cells, so elements may render wrongly." % (len(bad), cells))
+        for line in bad[:12]:
+            rep("  " + line)
+    else:
+        rep("ok    element table: %d columns (%d values) match" % (len(want), cells))
+
 def environment(rep, root):
     rep.section("Environment")
     rep("Nuke: %s" % getattr(nuke, "NUKE_VERSION_STRING", "?"))
@@ -536,6 +580,11 @@ class Diagnostic(object):
             self.built = group
             self.rep("Built %s; the compiled kernel is cached, so new BlinkFlare nodes are "
                      "instant from now on." % group.name())
+            try:
+                check_table(self.rep, group)
+            except Exception:
+                self.rep.problem("Checking the element table failed:")
+                self.rep(traceback.format_exc())
         else:
             self.rep.problem("Building the node failed:")
             for e in errors:

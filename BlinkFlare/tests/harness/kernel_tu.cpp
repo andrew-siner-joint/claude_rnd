@@ -17,11 +17,12 @@ static blink::ImageData wrap(BfImage im) {
   return d;
 }
 
-void bf_create(BfImage src, BfImage occlusion, BfImage dirt, BfImage out) {
+void bf_create(BfImage src, BfImage occlusion, BfImage dirt, BfImage elements, BfImage out) {
   g_kernel = new blink::KERNEL_CLASS();
   g_kernel->src.data = wrap(src);
   g_kernel->occlusion.data = wrap(occlusion);
   g_kernel->dirt.data = wrap(dirt);
+  g_kernel->elements.data = wrap(elements);
   g_kernel->dst.data = wrap(out);
   g_kernel->define();
 }

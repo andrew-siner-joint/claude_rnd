@@ -1,38 +1,43 @@
-// BlinkFlare - procedural lens flare for Nuke's BlinkScript node.
+// BlinkFlare v3 - procedural lens flare for Nuke's BlinkScript node.
 //
-// Every element is evaluated analytically per pixel (no convolutions, no
+// The flare is a stack of elements of any number and type. They arrive as
+// a small float image, the "elements" input: one column per element, six
+// rows of RGBA per column (layout in blinkflare/elements.py). The kernel
+// loops over the columns, so adding elements needs no recompile.
+//
+// Everything is evaluated analytically per pixel (no convolutions, no
 // intermediate buffers), so the kernel runs on the GPU when available and
 // vectorizes well on the CPU.
 //
 // Coordinate space: "frame units", where 1.0 == the frame height and x is
-// multiplied by the pixel aspect so round elements stay round on anamorphic
-// formats. Sizes and lengths are in frame units; widths/thicknesses are in
-// thousandths of the frame height.
+// multiplied by the pixel aspect. Sizes are in frame units; widths and
+// thicknesses in thousandths of the frame height.
 //
-// The flare axis runs from the light position through the articulation point.
-// An element at axis position t sits at  light + t * (articulation - light):
-// t = 0 is on the light, t = 1 on the articulation point, t = 2 mirrored.
+// The flare axis runs from the light through the articulation point. An
+// element at axis position t sits at  light + t * (articulation - light):
+// t = 0 on the light, t = 1 on the articulation point, t = 2 mirrored.
+//
+// Every element shares one lens: aperture blades/roundness/rotation shape
+// the ghosts and set the starburst spike count, coating colours tint ghost
+// sets, and dispersion, dust and barrel clipping apply throughout.
 //
 // Inputs:
-//   src        - the plate. Defines the output bounds and is sampled around
-//                the light when brightness/color follow the source.
-//   occlusion  - alpha (or depth, copied into red) sampled around the light
-//                to dim the flare.
+//   src        - the plate; defines the output bounds and is sampled at the
+//                light when brightness/colour follow the source.
+//   occlusion  - alpha (or depth, copied into red) sampled around the light.
 //   dirt       - lens dirt texture lit by the flare.
+//   elements   - the element table.
 // The output is the flare alone; the group composites it.
 //
-// soloElement renders a single element (1 glow, 2 glints, 3 streaks, 4 ring,
-// 5 ghosts, 6 spectral, 7 dirt; 0 = all). The group uses it for the viewer
-// solo and for per-element output layers.
-//
-// Parameter labels match variable names so the BlinkScript knobs are
-// predictably named BlinkFlareKernel_<param>.
+// soloPass renders one render pass (1 glow, 2 rays, 3 streaks, 4 ghosts,
+// 5 rings, 6 other, 7 dirt; 0 = everything).
 
 kernel BlinkFlareKernel : ImageComputationKernel<ePixelWise>
 {
   Image<eRead, eAccessRandom, eEdgeClamped> src;
   Image<eRead, eAccessRandom, eEdgeConstant> occlusion;
   Image<eRead, eAccessPoint, eEdgeConstant> dirt;
+  Image<eRead, eAccessRandom, eEdgeConstant> elements;
   Image<eWrite> dst;
 
   param:
@@ -48,9 +53,23 @@ kernel BlinkFlareKernel : ImageComputationKernel<ePixelWise>
     float4 masterTint;
     float  masterRotation;
     bool   spinWithLight;
-    float  elementAspect;
     float  offscreenFade;
-    int    soloElement;
+    int    soloPass;
+
+    // Lens
+    int    apertureBlades;
+    float  apertureRoundness;
+    float  apertureRotation;
+    float  anamorphic;
+    float  dispersion;
+    float  dust;
+    float  barrelClip;
+    float4 coatingA;
+    float4 coatingB;
+    float4 coatingC;
+
+    // Element table
+    int    elementCount;
 
     // Occlusion (mode 0 alpha, 1 depth as 1/z, 2 depth as z)
     bool   occlusionEnable;
@@ -60,113 +79,37 @@ kernel BlinkFlareKernel : ImageComputationKernel<ePixelWise>
     bool   occlusionInvert;
     float  lightDepth;
 
-    // Brightness and color driven by the plate at the light
+    // Brightness and colour driven by the plate at the light
     float  sourceIntensity;
     float  sourceColor;
     float  sourceRadius;
     float  sourceBlack;
     float  sourceWhite;
 
-    // Glow and core
-    bool   glowEnable;
-    float  glowIntensity;
-    float  glowSize;
-    float  glowFalloff;
-    float4 glowColor;
-    float  coreIntensity;
-    float  coreSize;
-    float4 coreColor;
-
-    // Glints (starburst rays)
-    bool   glintEnable;
-    float  glintIntensity;
-    int    glintCount;
-    float  glintLength;
-    float  glintLengthRandom;
-    float  glintWidth;
-    float  glintRotation;
-    float  glintFine;
-    float  glintSeed;
-    float4 glintColor;
-
-    // Streaks (anamorphic lines)
-    bool   streakEnable;
-    float  streakIntensity;
-    int    streakCount;
-    float  streakLength;
-    float  streakThickness;
-    float  streakAngle;
-    float  streakGlow;
-    float4 streakColor;
-
-    // Ring (halo / hoop)
-    bool   ringEnable;
-    float  ringIntensity;
-    float  ringRadius;
-    float  ringThickness;
-    float  ringSpectral;
-    float  ringAxisPos;
-    float  ringArc;
-    float  ringArcRotation;
-    float4 ringColor;
-
-    // Ghosts (iris / aperture reflections along the axis)
-    bool   ghostEnable;
-    float  ghostIntensity;
-    int    ghostCount;
-    float  ghostSeed;
-    float  ghostSize;
-    float  ghostSizeRandom;
-    float  ghostSpreadMin;
-    float  ghostSpreadMax;
-    int    ghostBlades;
-    float  ghostRoundness;
-    float  ghostRotation;
-    float  ghostSoftness;
-    float  ghostHollow;
-    float  ghostChroma;
-    float  ghostHueRandom;
-    float  ghostIntensityRandom;
-    float4 ghostColor;
-
-    // Spectral streaks (short rainbow streaks / arcs around the light)
-    bool   spectralEnable;
-    float  spectralIntensity;
-    int    spectralCount;
-    float  spectralSeed;
-    float  spectralLength;
-    float  spectralWidth;
-    float  spectralOffset;
-    float  spectralSpread;
-    float  spectralOrient;
-    float  spectralRandom;
-
     // Lens dirt
     bool   dirtEnable;
     float  dirtIntensity;
     float  dirtSpread;
     float  dirtResponse;
+    float4 dirtColor;
 
   local:
     float  _invH;
     float  _S;
-    float  _aspect;
+    float  _sq;
     float  _pa;
     float2 _L;
     float2 _A;
     float  _axisAngle;
     float  _fade;
-    float  _glintRot;
-    float  _streakRot;
-    float  _spectralRot;
-    float  _ghostRot;
-    float2 _streakDir;
-    float2 _streakStep;
-    float2 _ghostSeg0;
-    float2 _ghostSeg1;
-    float  _ghostReach;
-    float  _spectralRMin;
-    float  _spectralRMax;
+    float  _rot;
+    float  _spin;
+    float  _blades;
+    float  _round;
+    float  _apRot;
+    float  _starCount;
+    float2 _clipDir;
+    float  _clipBase;
 
   void define()
   {
@@ -180,10 +123,21 @@ kernel BlinkFlareKernel : ImageComputationKernel<ePixelWise>
     defineParam(masterTint, "masterTint", float4(1.0f, 1.0f, 1.0f, 1.0f));
     defineParam(masterRotation, "masterRotation", 0.0f);
     defineParam(spinWithLight, "spinWithLight", false);
-    defineParam(elementAspect, "elementAspect", 1.0f);
     defineParam(offscreenFade, "offscreenFade", 0.5f);
+    defineParam(soloPass, "soloPass", 0);
 
-    defineParam(soloElement, "soloElement", 0);
+    defineParam(apertureBlades, "apertureBlades", 6);
+    defineParam(apertureRoundness, "apertureRoundness", 0.2f);
+    defineParam(apertureRotation, "apertureRotation", 0.0f);
+    defineParam(anamorphic, "anamorphic", 1.0f);
+    defineParam(dispersion, "dispersion", 1.0f);
+    defineParam(dust, "dust", 0.3f);
+    defineParam(barrelClip, "barrelClip", 0.5f);
+    defineParam(coatingA, "coatingA", float4(1.0f, 0.45f, 0.85f, 1.0f));
+    defineParam(coatingB, "coatingB", float4(0.45f, 1.0f, 0.55f, 1.0f));
+    defineParam(coatingC, "coatingC", float4(1.0f, 0.7f, 0.3f, 1.0f));
+
+    defineParam(elementCount, "elementCount", 0);
 
     defineParam(occlusionEnable, "occlusionEnable", false);
     defineParam(occlusionMode, "occlusionMode", 0);
@@ -198,83 +152,16 @@ kernel BlinkFlareKernel : ImageComputationKernel<ePixelWise>
     defineParam(sourceBlack, "sourceBlack", 0.0f);
     defineParam(sourceWhite, "sourceWhite", 1.0f);
 
-    defineParam(glowEnable, "glowEnable", true);
-    defineParam(glowIntensity, "glowIntensity", 0.5f);
-    defineParam(glowSize, "glowSize", 0.1f);
-    defineParam(glowFalloff, "glowFalloff", 1.0f);
-    defineParam(glowColor, "glowColor", float4(1.0f, 0.82f, 0.62f, 1.0f));
-    defineParam(coreIntensity, "coreIntensity", 4.0f);
-    defineParam(coreSize, "coreSize", 0.012f);
-    defineParam(coreColor, "coreColor", float4(1.0f, 0.97f, 0.92f, 1.0f));
-
-    defineParam(glintEnable, "glintEnable", true);
-    defineParam(glintIntensity, "glintIntensity", 0.6f);
-    defineParam(glintCount, "glintCount", 12);
-    defineParam(glintLength, "glintLength", 0.3f);
-    defineParam(glintLengthRandom, "glintLengthRandom", 0.6f);
-    defineParam(glintWidth, "glintWidth", 2.0f);
-    defineParam(glintRotation, "glintRotation", 0.0f);
-    defineParam(glintFine, "glintFine", 0.4f);
-    defineParam(glintSeed, "glintSeed", 1.0f);
-    defineParam(glintColor, "glintColor", float4(1.0f, 0.9f, 0.78f, 1.0f));
-
-    defineParam(streakEnable, "streakEnable", true);
-    defineParam(streakIntensity, "streakIntensity", 0.6f);
-    defineParam(streakCount, "streakCount", 1);
-    defineParam(streakLength, "streakLength", 0.9f);
-    defineParam(streakThickness, "streakThickness", 2.0f);
-    defineParam(streakAngle, "streakAngle", 0.0f);
-    defineParam(streakGlow, "streakGlow", 0.8f);
-    defineParam(streakColor, "streakColor", float4(0.55f, 0.75f, 1.0f, 1.0f));
-
-    defineParam(ringEnable, "ringEnable", true);
-    defineParam(ringIntensity, "ringIntensity", 0.05f);
-    defineParam(ringRadius, "ringRadius", 0.25f);
-    defineParam(ringThickness, "ringThickness", 0.025f);
-    defineParam(ringSpectral, "ringSpectral", 0.8f);
-    defineParam(ringAxisPos, "ringAxisPos", 0.0f);
-    defineParam(ringArc, "ringArc", 0.0f);
-    defineParam(ringArcRotation, "ringArcRotation", 0.0f);
-    defineParam(ringColor, "ringColor", float4(1.0f, 1.0f, 1.0f, 1.0f));
-
-    defineParam(ghostEnable, "ghostEnable", true);
-    defineParam(ghostIntensity, "ghostIntensity", 0.12f);
-    defineParam(ghostCount, "ghostCount", 9);
-    defineParam(ghostSeed, "ghostSeed", 1.0f);
-    defineParam(ghostSize, "ghostSize", 0.06f);
-    defineParam(ghostSizeRandom, "ghostSizeRandom", 0.7f);
-    defineParam(ghostSpreadMin, "ghostSpreadMin", 0.3f);
-    defineParam(ghostSpreadMax, "ghostSpreadMax", 2.1f);
-    defineParam(ghostBlades, "ghostBlades", 6);
-    defineParam(ghostRoundness, "ghostRoundness", 0.25f);
-    defineParam(ghostRotation, "ghostRotation", 0.0f);
-    defineParam(ghostSoftness, "ghostSoftness", 0.08f);
-    defineParam(ghostHollow, "ghostHollow", 0.35f);
-    defineParam(ghostChroma, "ghostChroma", 0.04f);
-    defineParam(ghostHueRandom, "ghostHueRandom", 0.5f);
-    defineParam(ghostIntensityRandom, "ghostIntensityRandom", 0.6f);
-    defineParam(ghostColor, "ghostColor", float4(1.0f, 0.95f, 0.85f, 1.0f));
-
-    defineParam(spectralEnable, "spectralEnable", true);
-    defineParam(spectralIntensity, "spectralIntensity", 0.4f);
-    defineParam(spectralCount, "spectralCount", 12);
-    defineParam(spectralSeed, "spectralSeed", 1.0f);
-    defineParam(spectralLength, "spectralLength", 0.04f);
-    defineParam(spectralWidth, "spectralWidth", 1.5f);
-    defineParam(spectralOffset, "spectralOffset", 0.06f);
-    defineParam(spectralSpread, "spectralSpread", 0.05f);
-    defineParam(spectralOrient, "spectralOrient", 0.0f);
-    defineParam(spectralRandom, "spectralRandom", 0.7f);
-
     defineParam(dirtEnable, "dirtEnable", false);
     defineParam(dirtIntensity, "dirtIntensity", 1.0f);
     defineParam(dirtSpread, "dirtSpread", 0.45f);
     defineParam(dirtResponse, "dirtResponse", 1.0f);
+    defineParam(dirtColor, "dirtColor", float4(1.0f, 0.85f, 0.7f, 1.0f));
   }
 
   // ------------------------------------------------------------------ helpers
 
-  // Own abs and integer clamp/max: Blink's built-in overloads for these vary
+  // Own abs and integer clamp: Blink's built-in overloads for these vary
   // between Nuke versions, so the kernel avoids relying on them.
   float lfAbs(float x)
   {
@@ -306,6 +193,34 @@ kernel BlinkFlareKernel : ImageComputationKernel<ePixelWise>
     return t * t * (3.0f - 2.0f * t);
   }
 
+  // Smooth 1D value noise in 0..1.
+  float lfNoise1(float x)
+  {
+    float i = floor(x);
+    float f = x - i;
+    float u = f * f * (3.0f - 2.0f * f);
+    float a = lfHash(i * 1.7f + 0.3f);
+    return a + (lfHash((i + 1.0f) * 1.7f + 0.3f) - a) * u;
+  }
+
+  // Smooth 2D value noise in 0..1.
+  float lfNoise2(float2 p)
+  {
+    float ix = floor(p.x);
+    float iy = floor(p.y);
+    float fx = p.x - ix;
+    float fy = p.y - iy;
+    float ux = fx * fx * (3.0f - 2.0f * fx);
+    float uy = fy * fy * (3.0f - 2.0f * fy);
+    float a = lfHash(ix * 1.31f + iy * 17.17f);
+    float b = lfHash((ix + 1.0f) * 1.31f + iy * 17.17f);
+    float c = lfHash(ix * 1.31f + (iy + 1.0f) * 17.17f);
+    float d = lfHash((ix + 1.0f) * 1.31f + (iy + 1.0f) * 17.17f);
+    float top = a + (b - a) * ux;
+    float bottom = c + (d - c) * ux;
+    return top + (bottom - top) * uy;
+  }
+
   // Wrap an angle into -pi..pi.
   float lfWrapPi(float a)
   {
@@ -328,15 +243,6 @@ kernel BlinkFlareKernel : ImageComputationKernel<ePixelWise>
     return float3(r, g, b);
   }
 
-  float3 lfHue(float h)
-  {
-    float x = lfFract(h) * 6.0f;
-    float r = clamp(lfAbs(x - 3.0f) - 1.0f, 0.0f, 1.0f);
-    float g = clamp(2.0f - lfAbs(x - 2.0f), 0.0f, 1.0f);
-    float b = clamp(2.0f - lfAbs(x - 4.0f), 0.0f, 1.0f);
-    return float3(r, g, b);
-  }
-
   float3 lfRGB(float4 c)
   {
     return float3(c.x, c.y, c.z);
@@ -347,226 +253,490 @@ kernel BlinkFlareKernel : ImageComputationKernel<ePixelWise>
     return a + (b - a) * t;
   }
 
-  // ----------------------------------------------------------------- elements
-
-  float3 glowTerm(float rA)
+  // Offset from an element centre with anamorphic squeeze applied.
+  float2 lfSqueeze(float2 d)
   {
-    float gx = rA / max(glowSize * _S, 0.00001f);
-    float glow = glowIntensity * pow(1.0f + gx * gx, -max(glowFalloff, 0.05f));
-    float cx = rA / max(coreSize * _S, 0.00001f);
-    float core = coreIntensity * exp(-cx * cx);
-    return lfRGB(glowColor) * glow + lfRGB(coreColor) * core;
+    return float2(d.x / _sq, d.y);
   }
 
-  // One layer of starburst rays. Each angular sector holds one ray with a
-  // random jitter, length and brightness; only the three nearest sectors are
-  // evaluated so the cost is constant regardless of ray count.
-  float rayLayer(float r, float ang, int count, float len, float width, float seed, float rot)
+  // ------------------------------------------------------------- lens shapes
+
+  // Radius of the aperture outline at angle phi, relative to its corners.
+  float apertureEdge(float phi, float blades)
   {
-    float N = float(count);
+    if (blades < 3.0f) {
+      return 1.0f;
+    }
+    float seg = 6.28318531f / blades;
+    float a = phi - seg * floor(phi / seg) - seg * 0.5f;
+    float pr = cos(seg * 0.5f) / cos(a);
+    return pr + (1.0f - pr) * _round;
+  }
+
+  // One channel of an aperture-shaped ghost. q is the offset from the ghost
+  // centre over (radius * outline); returns body brightness inside the edge.
+  float ghostProfile(float q, float soft, float hollow, float rim)
+  {
+    float mask = 1.0f - lfSmooth(1.0f - soft, 1.0f, q);
+    if (mask <= 0.0f) {
+      return 0.0f;
+    }
+    float qi = min(q, 1.0f);
+    float body = 1.0f - hollow + hollow * qi * qi * qi * qi;
+    float e = (1.0f - q) / max(soft * 1.5f, 0.04f);
+    return mask * (body + rim * exp(-e * e));
+  }
+
+  // Cat's-eye vignetting: the ghost is cut by a circle pushed outward along
+  // the light's radial direction, more the further the light is off-centre.
+  float barrelMask(float2 d, float radius, float soft, float clip)
+  {
+    if (clip <= 0.0f) {
+      return 1.0f;
+    }
+    float2 o = _clipDir * (clip * radius);
+    float qc = length(d - o) / (radius * 1.05f);
+    return 1.0f - lfSmooth(1.0f - soft, 1.0f, qc);
+  }
+
+  // Mottled texture and bright specks inside ghosts (dust and coating flaws).
+  float dustTexture(float2 d, float radius, float amount, float seed)
+  {
+    if (amount <= 0.0f) {
+      return 1.0f;
+    }
+    // Mottling scales with the ghost; specks keep a fixed size in the frame,
+    // like dust on a lens element.
+    float2 offs = float2(seed * 7.1f, seed * 3.3f);
+    float n = lfNoise2(d / radius * 3.0f + offs);
+    float speck = lfSmooth(0.82f, 0.93f, lfNoise2(d / (0.012f * _S) + offs * 3.0f));
+    return max(1.0f + amount * (0.6f * (n - 0.5f) + 0.9f * speck), 0.0f);
+  }
+
+  // One channel of a ghost: r and edge are the pixel's distance from the
+  // ghost centre and the aperture outline in its direction.
+  float ghostOne(float2 d, float r, float edge, float radius, float soft, float hollow,
+                 float rim, float clip)
+  {
+    float s = clamp(max(soft, 1.5f * _invH / radius), 0.001f, 1.0f);
+    if (r > radius * edge * (1.0f + s)) {
+      return 0.0f;
+    }
+    return ghostProfile(r / (radius * edge), s, hollow, rim) * barrelMask(d, radius, s, clip);
+  }
+
+  // A ghost with per-channel radii around one centre (d is the squeezed
+  // offset from that centre).
+  float3 ghostRGB(float2 d, float3 radius, float soft, float hollow, float rim, float blades,
+                  float rot, float clip, float dustAmt, float seed)
+  {
+    float r = length(d);
+    float outer = max(radius.x, max(radius.y, radius.z));
+    if (r > outer * (1.0f + soft) + _invH * 2.0f) {
+      return float3(0.0f, 0.0f, 0.0f);
+    }
+    float edge = apertureEdge(atan2(d.y, d.x) - rot, blades);
+    float3 col = float3(ghostOne(d, r, edge, radius.x, soft, hollow, rim, clip),
+                        ghostOne(d, r, edge, radius.y, soft, hollow, rim, clip),
+                        ghostOne(d, r, edge, radius.z, soft, hollow, rim, clip));
+    return col * dustTexture(d, radius.y, dustAmt, seed);
+  }
+
+  // One ray's brightness for one channel: (along, perp) is the pixel in the
+  // ray's frame, rayLen that channel's length.
+  float rayAt(float along, float perp, float rayLen, float width, float h3, float shade,
+              float breakup, float noiseOffset)
+  {
+    if (along >= rayLen) {
+      return 0.0f;
+    }
+    float t = along / rayLen;
+    float w0 = width * (0.6f + 0.8f * h3) * (1.0f - 0.85f * t);
+    float w = max(w0, _invH * 0.75f);
+    float prof = exp(-(perp * perp) / (w * w)) * (w0 / w);
+    float fall = (1.0f - t) * (1.0f - t) * (0.35f + 0.65f * exp(-t * 5.0f));
+    float brk = 1.0f - clamp(breakup, 0.0f, 1.0f) * lfNoise1(t * 7.0f + noiseOffset);
+    return prof * fall * brk * shade;
+  }
+
+  // One layer of rays, with a ray length per channel (dispersion). Each
+  // angular sector holds one ray; only the three nearest sectors are
+  // evaluated, so cost doesn't grow with the count. Rays come in symmetric
+  // pairs when the count is even (like diffraction spikes); phase
+  // cross-fades to new random lengths (shimmer).
+  float3 rays(float r, float ang, float N, float3 len, float width, float seed, float rot,
+              float jitter, float lenRandom, float breakup, float phase)
+  {
     float a = lfFract((ang - rot) / 6.28318531f);
     float sector = a * N;
     float k0 = floor(sector);
-    float sum = 0.0f;
+    float pairs = floor(N * 0.5f);
+    bool paired = N - 2.0f * pairs < 0.5f && pairs > 0.0f;
+    float ph = floor(phase);
+    float pf = lfSmooth(0.0f, 1.0f, phase - ph);
+    float longest = max(len.x, max(len.y, len.z));
+    float3 sum = float3(0.0f, 0.0f, 0.0f);
     for (int j = -1; j <= 1; j++) {
       float k = k0 + float(j);
       float kw = k - N * floor(k / N);
-      float s = seed * 17.17f + kw * 7.13f;
-      float h0 = lfHash(s);
-      float dTheta = (sector - (k + 0.5f + (h0 - 0.5f) * 0.8f)) * 6.28318531f / N;
+      float id = paired ? kw - pairs * floor(kw / pairs) : kw;
+      float s = seed * 17.17f + id * 7.13f;
+      float h0 = lfHash(s + kw * 0.37f);
+      float dTheta = (sector - (k + 0.5f + (h0 - 0.5f) * jitter)) * 6.28318531f / N;
       if (lfAbs(dTheta) < 1.5f) {
         float along = r * cos(dTheta);
-        float h1 = lfHash(s + 1.71f);
-        float rayLen = len * (1.0f - clamp(glintLengthRandom, 0.0f, 0.95f) * h1);
-        if (along > 0.0f && along < rayLen) {
-          float h2 = lfHash(s + 3.37f);
+        float h1 = lfHash(s + 1.71f + ph * 19.3f);
+        h1 = h1 + (lfHash(s + 1.71f + (ph + 1.0f) * 19.3f) - h1) * pf;
+        float shrink = 1.0f - clamp(lenRandom, 0.0f, 0.95f) * h1;
+        if (along > 0.0f && along < longest * shrink) {
           float h3 = lfHash(s + 5.19f);
+          float shade = 1.0f - 0.5f * lfHash(s + 3.37f);
           float perp = r * sin(dTheta);
-          float t = along / rayLen;
-          float w0 = width * (0.5f + h3) * (1.0f - 0.85f * t);
-          float w = max(w0, _invH * 0.75f);
-          float prof = exp(-(perp * perp) / (w * w)) * (w0 / w);
-          float fall = (1.0f - t) * (1.0f - t) * (0.4f + 0.6f * exp(-t * 5.0f));
-          sum += prof * fall * (1.0f - 0.6f * h2);
+          float off = kw * 3.7f + seed;
+          sum += float3(rayAt(along, perp, len.x * shrink, width, h3, shade, breakup, off),
+                        rayAt(along, perp, len.y * shrink, width, h3, shade, breakup, off),
+                        rayAt(along, perp, len.z * shrink, width, h3, shade, breakup, off));
         }
       }
     }
     return sum;
   }
 
-  float3 glintTerm(float r, float ang)
+  // ---------------------------------------------------------------- elements
+  // Each takes the element's table rows and returns its colour (before the
+  // element intensity, which the loop applies).
+
+  float3 glow(float2 P, float4 r0, float3 color, float4 r2, float4 r3)
   {
-    int n = lfClampi(glintCount, 1, 256);
-    float len = max(glintLength * _S, 0.00001f);
-    float width = glintWidth * 0.001f * _S;
-    if (r >= len) {
+    float2 d = lfSqueeze(P - (_L + _A * r0.z));
+    float r = length(d);
+    float s = max(r0.w * _S, 0.00001f);
+    float f = -max(r3.x, 0.05f);
+    float disp = r2.z * dispersion;
+    float3 g = float3(pow(1.0f + (r * r) / (s * s * (1.0f + disp) * (1.0f + disp)), f),
+                      pow(1.0f + (r * r) / (s * s), f),
+                      pow(1.0f + (r * r) / (s * s * (1.0f - disp) * (1.0f - disp)), f));
+    float cs = max(s * r3.z, _invH);
+    float core = r3.y * exp(-(r * r) / (cs * cs));
+    float white = clamp(r3.w, 0.0f, 1.0f) * exp(-(r * r) / (s * s * 0.25f));
+    float3 tint = lfMix3(color, float3(1.0f, 1.0f, 1.0f), white);
+    return tint * g + lfMix3(color, float3(1.0f, 1.0f, 1.0f), clamp(r3.w, 0.0f, 1.0f)) * core;
+  }
+
+  float3 veil(float2 P, float4 r0, float3 color, float4 r3)
+  {
+    float2 d = lfSqueeze(P - (_L + _A * r0.z));
+    float s = max(r0.w * _S, 0.00001f);
+    float x = length(d) / s;
+    float lift = clamp(r3.x, 0.0f, 1.0f);
+    return color * (lift + (1.0f - lift) * pow(1.0f + x * x, -max(r3.y, 0.05f)));
+  }
+
+  float3 starburst(float r, float ang, float4 r0, float3 color, float4 r2, float4 r3, float4 r4)
+  {
+    float disp = r2.z * dispersion * 0.5f;
+    float len = max(r0.w * _S, 0.00001f);
+    if (r > len * (1.0f + lfAbs(disp))) {
       return float3(0.0f, 0.0f, 0.0f);
     }
-    float sum = rayLayer(r, ang, n, len, width, glintSeed, _glintRot);
-    if (glintFine > 0.0f && r < len * 0.55f) {
-      int nf = lfClampi(n * 4, 8, 512);
-      sum += glintFine * rayLayer(r, ang, nf, len * 0.55f, width * 0.5f, glintSeed + 41.0f, _glintRot);
+    float N = r3.x >= 1.0f ? floor(r3.x + 0.5f) : _starCount;
+    float width = r3.z * 0.001f * _S;
+    float rot = r2.x * 0.0174532925f + _rot + _spin;
+    float seed = r2.y;
+    float fine = r3.w;
+    float3 lens = float3(len * (1.0f + disp), len, len * (1.0f - disp));
+    float3 col = rays(r, ang, N, lens, width, seed, rot, 0.05f, r3.y, r4.x, 0.0f);
+    if (fine > 0.0f) {
+      col += rays(r, ang, N * 3.0f + 5.0f, lens * 0.5f, width * 0.5f, seed + 41.0f, rot,
+                  0.8f, 0.8f, r4.x, 0.0f) * fine;
     }
-    return lfRGB(glintColor) * (sum * glintIntensity);
+    return color * col;
   }
 
-  float3 streakTerm(float2 d)
+  // Brightness falloff along a streak at normalized distance u from its centre.
+  float streakFall(float u, float hot)
   {
-    int n = lfClampi(streakCount, 1, 16);
-    float len = max(streakLength * _S, 0.00001f);
-    float th0 = max(streakThickness * 0.001f * _S, _invH * 0.5f);
-    float sum = 0.0f;
-    float ca = _streakDir.x;
-    float sa = _streakDir.y;
-    for (int i = 0; i < n; i++) {
-      if (i > 0) {
-        float c2 = ca * _streakStep.x - sa * _streakStep.y;
-        sa = sa * _streakStep.x + ca * _streakStep.y;
-        ca = c2;
-      }
-      float u = lfAbs(d.x * ca + d.y * sa) / len;
-      if (u < 1.0f) {
-        float v = d.y * ca - d.x * sa;
-        float th = th0 * (1.0f - 0.6f * u);
-        float core = exp(-(v * v) / (th * th));
-        float halo = streakGlow * 0.25f * exp(-lfAbs(v) / (th * 8.0f));
-        float fall = (1.0f - u) * (1.0f - u) * (0.35f + 0.65f * exp(-u * 6.0f));
-        sum += (core + halo) * fall;
-      }
+    if (u >= 1.0f) {
+      return 0.0f;
     }
-    return lfRGB(streakColor) * (sum * streakIntensity);
+    return 0.65f * exp(-u * hot * 5.0f) + 0.35f * (1.0f - u) * (1.0f - u);
   }
 
-  float3 ringTerm(float2 P)
+  float3 streak(float2 P, float4 r0, float3 color, float4 r2, float4 r3, float4 r4)
   {
-    float2 c = _L + _A * ringAxisPos;
-    float2 d = P - c;
-    d.x = d.x / _aspect;
-    float r = length(d);
-    float T = max(ringThickness * _S, _invH);
-    float x = (r - ringRadius * _S) / T;
-    float3 col = float3(0.0f, 0.0f, 0.0f);
-    if (lfAbs(x) < 3.0f) {
-      float env = exp(-x * x * 2.0f);
-      float3 spec = lfSpectrum(clamp(0.5f + 0.4f * x, 0.0f, 1.0f)) * 1.6f;
-      float3 tint = lfMix3(float3(1.0f, 1.0f, 1.0f), spec, clamp(ringSpectral, 0.0f, 1.0f));
-      float arc = 1.0f;
-      if (ringArc > 0.0f) {
-        float phi = atan2(d.y, d.x) - (_axisAngle + ringArcRotation * 0.0174532925f);
-        arc = pow(0.5f + 0.5f * cos(phi), ringArc * 12.0f);
-      }
-      col = lfRGB(ringColor) * tint * (env * arc * ringIntensity);
-    }
-    return col;
-  }
-
-  float ghostMask(float q, float soft)
-  {
-    return 1.0f - lfSmooth(1.0f - soft, 1.0f, q);
-  }
-
-  float3 ghostTerm(float2 P)
-  {
-    int n = lfClampi(ghostCount, 0, 64);
-    bool poly = ghostBlades >= 3;
-    float blade = 6.28318531f / float(lfClampi(ghostBlades, 3, 1000));
-    float polyIn = cos(blade * 0.5f);
-    float ca = clamp(ghostChroma, -0.5f, 0.5f);
+    float2 d = P - (_L + _A * r0.z);
+    float len = max(r0.w * _S, 0.00001f);
+    float disp = r2.z * dispersion * 0.5f;
+    float th0 = max(r3.x * 0.001f * _S, _invH * 0.5f);
+    int count = lfClampi(int(r3.y + 0.5f), 1, 8);
+    float hot = r3.z;
+    float haze = r3.w;
+    int lines = lfClampi(int(r4.x + 0.5f), 1, 5);
+    float spacing = r4.y * 0.001f * _S;
+    float breakup = clamp(r4.z, 0.0f, 1.0f);
+    float rot = r2.x * 0.0174532925f + _rot;
     float3 sum = float3(0.0f, 0.0f, 0.0f);
-    float2 Pa = float2(P.x / _aspect, P.y);
-    float2 seg = _ghostSeg1 - _ghostSeg0;
-    float st = clamp(dot(Pa - _ghostSeg0, seg) / max(dot(seg, seg), 0.0000001f), 0.0f, 1.0f);
-    if (length(Pa - (_ghostSeg0 + seg * st)) > _ghostReach) {
+    for (int i = 0; i < count; i++) {
+      float a = rot + float(i) * 3.14159265f / float(count);
+      float ca = cos(a);
+      float sa = sin(a);
+      float u = lfAbs(d.x * ca + d.y * sa) / len;
+      if (u >= 1.0f + lfAbs(disp)) {
+        continue;
+      }
+      float v = d.y * ca - d.x * sa;
+      float3 fall = float3(streakFall(u / (1.0f + disp), hot), streakFall(u, hot),
+                           streakFall(u / (1.0f - disp), hot));
+      float brk = 1.0f - breakup * lfNoise1(u * 14.0f + float(i) * 7.0f + r2.y);
+      float th = th0 * (1.0f - 0.5f * min(u, 1.0f));
+      float profile = 0.0f;
+      for (int l = 0; l < lines; l++) {
+        float off = (float(l) - float(lines - 1) * 0.5f) * spacing;
+        float vv = v - off;
+        float weight = (lines == 1 || 2 * l == lines - 1) ? 1.0f : 0.4f;
+        profile += weight * exp(-(vv * vv) / (th * th));
+      }
+      profile += haze * 0.3f * exp(-lfAbs(v) / (th0 * max(r4.w, 1.0f)));
+      // White-hot near the light, the element colour along the tails.
+      float3 tint = lfMix3(float3(1.0f, 1.0f, 1.0f), color, lfSmooth(0.0f, 0.2f, u));
+      sum += tint * fall * (profile * brk);
+    }
+    return sum;
+  }
+
+  float3 ring(float2 P, float4 r0, float3 color, float4 r2, float4 r3)
+  {
+    float2 d = lfSqueeze(P - (_L + _A * r0.z));
+    float r = length(d);
+    float T = max(r3.x * _S, _invH);
+    float x = (r - r0.w * _S) / T;
+    if (lfAbs(x) >= 3.0f) {
+      return float3(0.0f, 0.0f, 0.0f);
+    }
+    float env = exp(-x * x * 2.0f);
+    float3 spec = lfSpectrum(clamp(0.5f + 0.4f * x, 0.0f, 1.0f)) * 1.6f;
+    float3 tint = lfMix3(float3(1.0f, 1.0f, 1.0f), spec, clamp(r2.z, 0.0f, 1.0f));
+    float arc = 1.0f;
+    if (r3.y > 0.0f) {
+      float phi = atan2(d.y, d.x) - (_axisAngle + r2.x * 0.0174532925f);
+      arc = pow(0.5f + 0.5f * cos(phi), r3.y * 12.0f);
+    }
+    return color * tint * (env * arc);
+  }
+
+  float3 iris(float2 P, float4 r0, float3 color, float4 r2, float4 r3, float4 r4)
+  {
+    float2 d = lfSqueeze(P - (_L + _A * r0.z));
+    float radius = max(r0.w * _S, _invH * 2.0f);
+    float ca = clamp(r2.z * dispersion, -0.5f, 0.5f);
+    float blades = r3.x >= 3.0f ? floor(r3.x + 0.5f) : _blades;
+    float3 radii = float3(radius * (1.0f + ca), radius, radius * (1.0f - ca));
+    return color * ghostRGB(d, radii, r2.w, clamp(r3.y, 0.0f, 1.0f), r3.z,
+                            blades, _apRot + r2.x * 0.0174532925f, r3.w * _clipBase,
+                            r4.x * dust, r2.y);
+  }
+
+  float3 ghostSet(float2 P, float4 r0, float3 color, float4 r2, float4 r3, float4 r4)
+  {
+    int n = lfClampi(int(r3.x + 0.5f), 0, 64);
+    float t0 = r0.z;
+    float t1 = r3.y;
+    float sizeMax = max(r0.w * _S, _invH * 2.0f);
+    float ca = clamp(r2.z * dispersion, -0.5f, 0.5f);
+    float soft = r2.w;
+    float reachMax = sizeMax * (1.0f + lfAbs(ca) + soft) + _invH * 2.0f;
+    float3 sum = float3(0.0f, 0.0f, 0.0f);
+
+    // All ghosts lie on one segment of the axis; skip pixels far from it.
+    float2 Pa = lfSqueeze(P);
+    float2 s0 = lfSqueeze(_L + _A * t0);
+    float2 seg = lfSqueeze(_A * (t1 - t0));
+    float st = clamp(dot(Pa - s0, seg) / max(dot(seg, seg), 0.0000001f), 0.0f, 1.0f);
+    if (length(Pa - (s0 + seg * st)) > reachMax) {
       return sum;
     }
+    float sizeRandom = clamp(r3.z, 0.0f, 0.95f);
+    float coat = clamp(r3.w, 0.0f, 1.0f);
+    float hollow = clamp(r4.x, 0.0f, 1.0f);
+    float rim = r4.y;
+    float intensityRandom = clamp(r4.z, 0.0f, 1.0f);
+    float clip = r4.w * _clipBase;
     for (int i = 0; i < n; i++) {
-      float s = ghostSeed * 13.37f + float(i) * 5.31f;
+      float s = r2.y * 13.37f + float(i) * 5.31f;
       float h0 = lfHash(s);
       float h1 = lfHash(s + 1.13f);
-      float t = ghostSpreadMin + (ghostSpreadMax - ghostSpreadMin) * h0;
-      float2 c = _L + _A * t;
-      float size = max(ghostSize * _S * (1.0f - clamp(ghostSizeRandom, 0.0f, 0.95f) * h1), _invH * 2.0f);
-      float2 d = P - c;
-      d.x = d.x / _aspect;
-      float r = length(d);
-      float reach = size * (1.0f + lfAbs(ca) + ghostSoftness) + _invH * 2.0f;
-      if (r > reach) {
+      float t = t0 + (t1 - t0) * h0;
+      float size = max(sizeMax * (1.0f - sizeRandom * h1), _invH * 2.0f);
+      float2 d = lfSqueeze(P - (_L + _A * t));
+      if (length(d) > size * (1.0f + lfAbs(ca) + soft) + _invH * 2.0f) {
         continue;
       }
       float h2 = lfHash(s + 2.71f);
       float h3 = lfHash(s + 4.07f);
-      float shape = 1.0f;
-      if (poly) {
-        float phi = atan2(d.y, d.x) - _ghostRot;
-        float a = phi - blade * floor(phi / blade) - blade * 0.5f;
-        float pr = polyIn / cos(a);
-        shape = pr + (1.0f - pr) * clamp(ghostRoundness, 0.0f, 1.0f);
+      float3 coating = lfRGB(coatingA);
+      if (h3 > 0.667f) {
+        coating = lfRGB(coatingC);
+      } else if (h3 > 0.333f) {
+        coating = lfRGB(coatingB);
       }
-      float q = r / (size * shape);
-      float soft = clamp(max(ghostSoftness, 1.5f * _invH / size), 0.001f, 1.0f);
-      float mr = ghostMask(q / (1.0f + ca), soft);
-      float mg = ghostMask(q, soft);
-      float mb = ghostMask(q / (1.0f - ca), soft);
-      float qi = min(q, 1.0f);
-      float inner = 1.0f - ghostHollow + ghostHollow * qi * qi * qi * qi;
-      float bright = (1.0f - clamp(ghostIntensityRandom, 0.0f, 1.0f) * h2) * inner;
-      float3 tint = lfMix3(float3(1.0f, 1.0f, 1.0f), lfHue(h3), clamp(ghostHueRandom, 0.0f, 1.0f));
-      sum += float3(mr, mg, mb) * tint * bright;
+      float3 tint = lfMix3(color, coating, coat);
+      // Bigger ghosts spread the same light over more area: dimmer.
+      float energy = min(sizeMax / size, 4.0f);
+      float bright = (1.0f - intensityRandom * h2) * energy;
+      float3 radii = float3(size * (1.0f + ca), size, size * (1.0f - ca));
+      sum += tint * ghostRGB(d, radii, soft, hollow, rim, _blades, _apRot, clip, dust, s) * bright;
     }
-    return lfRGB(ghostColor) * sum * ghostIntensity;
+    return sum;
   }
 
-  // Short rainbow streaks scattered around the light. Evaluated in polar
-  // space so orientation 0 gives radial streaks and 1 gives curved arcs.
-  // The spectrum always runs radially, like real dispersion.
-  float3 spectralTerm(float r, float ang)
+  // Short rainbow streaks scattered around the light, evaluated in polar
+  // space: orientation 0 gives radial streaks, 1 curved arcs. The spectrum
+  // always runs radially, like real dispersion.
+  float3 spectral(float r, float ang, float4 r0, float3 color, float4 r2, float4 r3, float4 r4)
   {
-    int n = lfClampi(spectralCount, 0, 64);
+    int n = lfClampi(int(r3.x + 0.5f), 0, 64);
     float N = float(lfClampi(n, 1, 64));
-    float len = max(spectralLength * _S, 0.00001f);
-    float w = max(spectralWidth * 0.001f * _S, _invH * 0.75f);
-    float beta = clamp(spectralOrient, 0.0f, 1.0f) * 1.57079633f;
+    float len = max(r0.w * _S, 0.00001f);
+    float w = max(r3.y * 0.001f * _S, _invH * 0.75f);
+    float offset = r3.z * _S;
+    float spread = r3.w * _S;
+    float beta = clamp(r4.x, 0.0f, 1.0f) * 1.57079633f;
     float cb = cos(beta);
     float sb = sin(beta);
-    float rnd = clamp(spectralRandom, 0.0f, 1.0f);
+    float rnd = clamp(r4.y, 0.0f, 1.0f);
+    float rot = r2.x * 0.0174532925f + _rot + _spin;
     float3 sum = float3(0.0f, 0.0f, 0.0f);
-    if (r < _spectralRMin || r > _spectralRMax) {
+    float reach0 = len + w * 4.0f;
+    if (r < min(offset, offset + spread) - reach0 || r > max(offset, offset + spread) + reach0) {
       return sum;
     }
     for (int i = 0; i < n; i++) {
-      float s = spectralSeed * 11.71f + float(i) * 3.97f;
+      float s = r2.y * 11.71f + float(i) * 3.97f;
       float h1 = lfHash(s + 1.37f);
-      float dr = r - (spectralOffset + spectralSpread * h1) * _S;
-      if (lfAbs(dr) > len + w * 4.0f) {
+      float dr = r - (offset + spread * h1);
+      if (lfAbs(dr) > reach0) {
         continue;
       }
       float h0 = lfHash(s);
       float h2 = lfHash(s + 2.53f);
-      float a = _spectralRot + (float(i) + 0.5f + (h0 - 0.5f) * rnd) * 6.28318531f / N;
+      float a = rot + (float(i) + 0.5f + (h0 - 0.5f) * rnd) * 6.28318531f / N;
       float L = len * (1.0f - 0.6f * rnd * h2);
       float dt = lfWrapPi(ang - a) * r;
       float reach = L + w * 4.0f;
       if (lfAbs(dr) > reach || lfAbs(dt) > reach) {
         continue;
       }
-      float h3 = lfHash(s + 3.89f);
       float u = (dr * cb + dt * sb) / L;
       if (lfAbs(u) >= 1.0f) {
         continue;
       }
+      float h3 = lfHash(s + 3.89f);
       float v = dt * cb - dr * sb;
       float prof = exp(-(v * v) / (w * w)) * (1.0f - u * u);
       float ext = L * cb + w * 1.2f * sb;
-      float st = clamp(0.5f + 0.5f * dr / ext, 0.0f, 1.0f);
-      sum += lfSpectrum(st) * (prof * (1.0f - 0.5f * rnd * h3));
+      float sp = clamp(0.5f + 0.5f * dr / ext, 0.0f, 1.0f);
+      sum += lfSpectrum(sp) * (prof * (1.0f - 0.5f * rnd * h3));
     }
-    return sum * spectralIntensity;
+    return color * sum;
+  }
+
+  // A bright crescent: a disc minus an offset disc, brightest on its outer rim.
+  float caustic1(float2 d, float R, float thick, float sharp, float soft, float2 dir)
+  {
+    float qo = length(d) / R;
+    if (qo > 1.0f + soft) {
+      return 0.0f;
+    }
+    float outer = 1.0f - lfSmooth(1.0f - soft, 1.0f, qo);
+    float Ri = R * (1.0f - thick * 0.5f);
+    float qi = length(d - dir * (R * thick * 0.5f)) / Ri;
+    float inner = 1.0f - lfSmooth(1.0f - soft * 2.0f, 1.0f, qi);
+    float rimv = lfSmooth(0.6f, 1.0f, qo);
+    return outer * (1.0f - inner) * (1.0f - sharp + sharp * 2.0f * rimv);
+  }
+
+  float3 caustic(float2 P, float4 r0, float3 color, float4 r2, float4 r3)
+  {
+    float2 c = _L + _A * r0.z;
+    float2 d = lfSqueeze(P - c);
+    float R = max(r0.w * _S, _invH * 2.0f);
+    float soft = clamp(max(r2.w, 1.5f * _invH / R), 0.001f, 1.0f);
+    if (length(d) > R * (1.0f + soft) * 1.1f) {
+      return float3(0.0f, 0.0f, 0.0f);
+    }
+    // Thick side faces away from the light along the flare axis.
+    float a = _axisAngle + 3.14159265f + r2.x * 0.0174532925f;
+    float2 dir = float2(cos(a), sin(a));
+    float thick = clamp(r3.x, 0.0f, 1.0f);
+    float sharp = clamp(r3.y, 0.0f, 1.0f);
+    float spec = r2.z * 0.04f;
+    float3 col = float3(caustic1(d, R * (1.0f + spec), thick, sharp, soft, dir),
+                        caustic1(d, R, thick, sharp, soft, dir),
+                        caustic1(d, R * (1.0f - spec), thick, sharp, soft, dir));
+    return color * col;
+  }
+
+  float3 shimmer(float r, float ang, float4 r0, float3 color, float4 r2, float4 r3)
+  {
+    float len = max(r0.w * _S, 0.00001f);
+    float disp = r2.z * dispersion * 0.5f;
+    if (r > len * (1.0f + lfAbs(disp))) {
+      return float3(0.0f, 0.0f, 0.0f);
+    }
+    float N = max(floor(r3.x + 0.5f), 1.0f);
+    float width = r3.z * 0.001f * _S;
+    float rot = r2.x * 0.0174532925f + _rot + _spin;
+    float lr = clamp(r3.w, 0.0f, 0.95f);
+    float3 lens = float3(len * (1.0f + disp), len, len * (1.0f - disp));
+    return color * rays(r, ang, N, lens, width, r2.y, rot, 0.9f, lr, 0.4f, r3.y);
+  }
+
+  // One ghost generated from a lens prescription: each channel has its own
+  // position along the axis and size (glass dispersion).
+  // One channel of a lens ghost, d being the offset from that channel's centre.
+  float lensChannel(float2 d, float radius, float soft, float hollow, float rim, float clip)
+  {
+    float r = length(d);
+    // ghostOne is zero beyond radius * edge * (1 + soft), with edge and soft <= 1.
+    if (r > radius * 2.0f) {
+      return 0.0f;
+    }
+    float edge = apertureEdge(atan2(d.y, d.x) - _apRot, _blades);
+    return ghostOne(d, r, edge, radius, soft, hollow, rim, clip);
+  }
+
+  float3 lensGhost(float2 P, float4 r0, float3 color, float4 r2, float4 r3, float4 r5)
+  {
+    float soft = r2.w;
+    float clip = r3.x * _clipBase;
+    float dustAmt = r3.y * dust;
+    float hollow = clamp(r3.z, 0.0f, 1.0f);
+    float rim = r3.w;
+    float rG = max(r0.w * _S, _invH * 2.0f);
+    float rR = max(r5.y * _S, _invH * 2.0f);
+    float rB = max(r5.w * _S, _invH * 2.0f);
+    float2 dG = lfSqueeze(P - (_L + _A * r0.z));
+    float3 col = float3(lensChannel(lfSqueeze(P - (_L + _A * r5.x)), rR, soft, hollow, rim, clip),
+                        lensChannel(dG, rG, soft, hollow, rim, clip),
+                        lensChannel(lfSqueeze(P - (_L + _A * r5.z)), rB, soft, hollow, rim, clip));
+    if (col.x + col.y + col.z <= 0.0f) {
+      return col;
+    }
+    return color * col * dustTexture(dG, rG, dustAmt, r0.z * 31.0f);
+  }
+
+  // Generous bound for elements centred on the flare axis; false when the
+  // pixel can't be touched (so the remaining table rows needn't be read).
+  bool nearAxisElement(float2 P, float t, float size, float slack)
+  {
+    float2 d = lfSqueeze(P - (_L + _A * t));
+    return length(d) <= size * _S * slack + _invH * 4.0f;
   }
 
   float3 dirtTerm(float rA, float3 flare, float4 dv)
   {
     float x = rA / max(dirtSpread * _S, 0.00001f);
-    float3 light = lfRGB(glowColor) * exp(-x * x) + flare * dirtResponse;
+    float3 light = lfRGB(dirtColor) * exp(-x * x) + flare * dirtResponse;
     return float3(dv.x, dv.y, dv.z) * light * dirtIntensity;
   }
 
@@ -576,7 +746,7 @@ kernel BlinkFlareKernel : ImageComputationKernel<ePixelWise>
   {
     _invH = 1.0f / max(formatSize.y, 1.0f);
     _S = max(masterScale, 0.0001f);
-    _aspect = max(elementAspect, 0.05f);
+    _sq = max(anamorphic, 0.05f);
     _pa = max(pixelAspect, 0.01f);
     _L = float2(lightPos.x * _pa * _invH, lightPos.y * _invH);
     float2 C = float2(axisCenter.x * _pa * _invH, axisCenter.y * _invH);
@@ -584,30 +754,23 @@ kernel BlinkFlareKernel : ImageComputationKernel<ePixelWise>
     _axisAngle = atan2(_L.y - C.y, _L.x - C.x);
 
     float deg = 0.0174532925f;
-    float spin = spinWithLight ? _axisAngle : 0.0f;
-    _glintRot = (masterRotation + glintRotation) * deg + spin;
-    _streakRot = (masterRotation + streakAngle) * deg;
-    _spectralRot = masterRotation * deg + spin;
-    _ghostRot = (masterRotation + ghostRotation) * deg + 1.57079633f;
+    _rot = masterRotation * deg;
+    _spin = spinWithLight ? _axisAngle : 0.0f;
+    _blades = apertureBlades >= 3 ? float(apertureBlades) : 0.0f;
+    _round = clamp(apertureRoundness, 0.0f, 1.0f);
+    _apRot = (apertureRotation + masterRotation) * deg + 1.57079633f;
+    if (_blades < 3.0f) {
+      _starCount = 16.0f;
+    } else if (apertureBlades - 2 * (apertureBlades / 2) == 0) {
+      _starCount = _blades;
+    } else {
+      _starCount = _blades * 2.0f;
+    }
 
-    int ns = lfClampi(streakCount, 1, 16);
-    _streakDir = float2(cos(_streakRot), sin(_streakRot));
-    _streakStep = float2(cos(3.14159265f / float(ns)), sin(3.14159265f / float(ns)));
-
-    // Ghosts all lie on one segment of the axis; pixels farther from it than
-    // the largest ghost can skip the ghost loop.
-    float2 La = float2(_L.x / _aspect, _L.y);
-    float2 Aa = float2(_A.x / _aspect, _A.y);
-    _ghostSeg0 = La + Aa * ghostSpreadMin;
-    _ghostSeg1 = La + Aa * ghostSpreadMax;
-    _ghostReach = max(ghostSize * _S, _invH * 2.0f) * (1.0f + lfAbs(clamp(ghostChroma, -0.5f, 0.5f)) + ghostSoftness) + _invH * 2.0f;
-
-    // Spectral streaks live in an annulus around the light.
-    float sReach = max(spectralLength * _S, 0.00001f) + max(spectralWidth * 0.001f * _S, _invH * 0.75f) * 4.0f;
-    float sr0 = spectralOffset * _S;
-    float sr1 = (spectralOffset + spectralSpread) * _S;
-    _spectralRMin = min(sr0, sr1) - sReach;
-    _spectralRMax = max(sr0, sr1) + sReach;
+    float2 radial = _L - C;
+    float dist = length(radial);
+    _clipDir = dist > 0.000001f ? radial / dist : float2(1.0f, 0.0f);
+    _clipBase = max(barrelClip, 0.0f) * dist * 1.5f;
 
     // Fade out as the light leaves the frame (distance in frame units).
     float W = formatSize.x * _pa * _invH;
@@ -673,34 +836,70 @@ kernel BlinkFlareKernel : ImageComputationKernel<ePixelWise>
       float2 P = float2((float(pos.x) + 0.5f) * _pa * _invH, (float(pos.y) + 0.5f) * _invH);
       float2 d = P - _L;
       float r = length(d);
-      float rA = length(float2(d.x / _aspect, d.y));
       float ang = atan2(d.y, d.x);
 
-      bool showAll = soloElement < 1 || soloElement > 7;
-      bool dirtSolo = soloElement == 7;
+      bool showAll = soloPass < 1 || soloPass > 7;
+      bool dirtSolo = soloPass == 7;
       // Dirt reacts to the other elements, so soloing it still evaluates them.
       bool forDirt = dirtSolo && dirtEnable && dirtResponse > 0.0f;
 
-      if (glowEnable && (showAll || forDirt || soloElement == 1)) {
-        col += glowTerm(rA);
+      int n = lfClampi(elementCount, 0, 96);
+      for (int i = 0; i < n; i++) {
+        float4 r0 = elements(i, 0);
+        int code = int(r0.x + 0.5f);
+        if (code <= 0 || r0.y == 0.0f) {
+          continue;
+        }
+        float4 r1 = elements(i, 1);
+        int pass = int(r1.w + 0.5f);
+        if (!(showAll || forDirt || pass == soloPass)) {
+          continue;
+        }
+        float4 r2 = elements(i, 2);
+        // Cheap rejection for elements with a known footprint, before the
+        // remaining rows are read. Slack covers softness and chromatic size.
+        float slack = 1.6f + max(r2.w, 0.0f) * 1.2f;
+        if ((code == 6 || code == 9) && !nearAxisElement(P, r0.z, r0.w, slack)) {
+          continue;
+        }
+        if (code == 12 && !nearAxisElement(P, r0.z, r0.w, slack)) {
+          float4 r5 = elements(i, 5);
+          if (!nearAxisElement(P, r5.x, r5.y, slack) && !nearAxisElement(P, r5.z, r5.w, slack)) {
+            continue;
+          }
+        }
+        float3 color = lfRGB(r1);
+        float4 r3 = elements(i, 3);
+        float3 e = float3(0.0f, 0.0f, 0.0f);
+        if (code == 1) {
+          e = glow(P, r0, color, r2, r3);
+        } else if (code == 2) {
+          e = veil(P, r0, color, r3);
+        } else if (code == 3) {
+          e = starburst(r, ang, r0, color, r2, r3, elements(i, 4));
+        } else if (code == 4) {
+          e = streak(P, r0, color, r2, r3, elements(i, 4));
+        } else if (code == 5) {
+          e = ring(P, r0, color, r2, r3);
+        } else if (code == 6) {
+          e = iris(P, r0, color, r2, r3, elements(i, 4));
+        } else if (code == 7) {
+          e = ghostSet(P, r0, color, r2, r3, elements(i, 4));
+        } else if (code == 8) {
+          e = spectral(r, ang, r0, color, r2, r3, elements(i, 4));
+        } else if (code == 9) {
+          e = caustic(P, r0, color, r2, r3);
+        } else if (code == 10) {
+          e = shimmer(r, ang, r0, color, r2, r3);
+        } else if (code == 12) {
+          e = lensGhost(P, r0, color, r2, r3, elements(i, 5));
+        }
+        col += e * r0.y;
       }
-      if (glintEnable && (showAll || forDirt || soloElement == 2)) {
-        col += glintTerm(r, ang);
-      }
-      if (streakEnable && (showAll || forDirt || soloElement == 3)) {
-        col += streakTerm(d);
-      }
-      if (ringEnable && (showAll || forDirt || soloElement == 4)) {
-        col += ringTerm(P);
-      }
-      if (ghostEnable && (showAll || forDirt || soloElement == 5)) {
-        col += ghostTerm(P);
-      }
-      if (spectralEnable && (showAll || forDirt || soloElement == 6)) {
-        col += spectralTerm(r, ang);
-      }
+
       if (dirtEnable && (showAll || dirtSolo)) {
         float4 dv = dirt();
+        float rA = length(lfSqueeze(d));
         float3 dc = dirtTerm(rA, col, dv);
         if (dirtSolo) {
           col = dc;

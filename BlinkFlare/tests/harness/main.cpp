@@ -2,6 +2,7 @@
 //
 //   blinkflare_render --list-params
 //   blinkflare_render W H params.txt out.raw [--src f] [--occlusion f] [--dirt f]
+//                     [--elements f N]   (element table: N columns x 6 rows)
 //
 // params.txt: one "name v0 [v1 ...]" per line. Images are raw float32 RGBA,
 // W*H*4 floats, row 0 at the bottom.
@@ -27,7 +28,7 @@ int main(int argc, char** argv) {
   if (argc >= 2 && std::strcmp(argv[1], "--list-params") == 0) {
     std::vector<float> dummy(4, 0.0f);
     BfImage im{dummy.data(), 1, 1};
-    bf_create(im, im, im, im);
+    bf_create(im, im, im, im, im);
     for (int i = 0; i < bf_param_count(); i++) {
       std::printf("%s %d\n", bf_param_name(i), bf_param_components(i));
     }
@@ -41,9 +42,21 @@ int main(int argc, char** argv) {
   int h = std::atoi(argv[2]);
   size_t n = static_cast<size_t>(w) * static_cast<size_t>(h) * 4;
   std::vector<float> src(n, 0.0f), occlusion(n, 0.0f), dirt(n, 0.0f), out(n, 0.0f);
+  std::vector<float> table(4, 0.0f);
+  int columns = 1;
 
   for (int i = 5; i + 1 < argc; i += 2) {
     std::string flag = argv[i];
+    if (flag == "--elements" && i + 2 < argc) {
+      columns = std::atoi(argv[i + 2]);
+      table.assign(static_cast<size_t>(columns) * 6 * 4, 0.0f);
+      if (!loadRaw(argv[i + 1], table)) {
+        std::fprintf(stderr, "bad element table %s\n", argv[i + 1]);
+        return 2;
+      }
+      i++;
+      continue;
+    }
     std::vector<float>* target = flag == "--src" ? &src
                                : flag == "--occlusion" ? &occlusion
                                : flag == "--dirt" ? &dirt : nullptr;
@@ -54,7 +67,8 @@ int main(int argc, char** argv) {
   }
 
   bf_create(BfImage{src.data(), w, h}, BfImage{occlusion.data(), w, h},
-            BfImage{dirt.data(), w, h}, BfImage{out.data(), w, h});
+            BfImage{dirt.data(), w, h}, BfImage{table.data(), columns, 6},
+            BfImage{out.data(), w, h});
 
   std::ifstream pf(argv[3]);
   std::string line;

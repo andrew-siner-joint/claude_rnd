@@ -16,6 +16,7 @@ FUNCTIONS = {
     "min": min,
     "clamp": lambda x, lo, hi: min(max(x, lo), hi),
     "noise": lambda *a: 0.0,
+    "floor": math.floor,
 }
 CONSTANTS = {"frame": 1.0, "pi": math.pi}
 TOKEN = re.compile(r"[A-Za-z_][A-Za-z_0-9]*(?:\.[A-Za-z_0-9]+)*")

@@ -88,6 +88,7 @@ class InstallerTest(unittest.TestCase):
         self.assertIn("ok    basic kernel: compiled at once", report)
         self.assertIn("ok    BlinkFlare kernel: compiled at once", report)
         self.assertIn("Built BlinkFlare1", report)
+        self.assertRegex(report, r"ok    element table: \d+ columns \(\d+ values\) match")
         self.assertNotIn("More test kernels", report)  # only run when something fails
         self.assertEqual(set(fake_nuke.compile_gpu), {False})  # test compiles are CPU-only
         self.assertNotIn("PROBLEM", report)
@@ -97,6 +98,14 @@ class InstallerTest(unittest.TestCase):
             self.assertIn('nuke.pluginAddPath(r"%s")' % ROOT.replace("\\", "/"), f.read())
         self.assertIsNotNone(fake_nuke.menu("Nodes").findItem("Draw/BlinkFlare/BlinkFlare"))
         self.assertIsNotNone(fake_nuke.menu("Nodes").findItem("Draw/BlinkFlare/Check Install..."))
+
+    def test_element_table_mismatch_is_reported(self):
+        fake_nuke.EXPRESSION_CHANNELS[:] = [3, 1, 2, 0]  # as if expr0 wrote alpha
+        report = self.run_main()
+        self.assertIn("The element table Nuke computes differs", report)
+        self.assertRegex(report, r"column \d+ row \d+ (red|alpha): Nuke")
+        self.assertNotIn("TableProbe", [n.name() for n in fake_nuke.root().node("BlinkFlare1").children()])
+        self.assertIn("found problems", fake_nuke.messages[-1])
 
     def test_diagnose_entry_point_runs_installer(self):
         sys.path.insert(0, ROOT)
@@ -173,8 +182,8 @@ class InstallerTest(unittest.TestCase):
     def test_rejected_function_is_found(self):
         fake_nuke.BLINK_REJECT.append("lfWrapPi(ang - a)")
         report = self.run_main()
-        self.assertIn("rejects these kernel functions: spectralTerm", report)
-        self.assertIn("spectralTerm starts at line", report)
+        self.assertIn("rejects these kernel functions: spectral", report)
+        self.assertIn("spectral starts at line", report)
         self.assertNotIn("Built BlinkFlare", report)
         self.assertEqual(self.root_nodes(), [])
         self.assertIn("found problems", fake_nuke.messages[-1])
@@ -225,7 +234,7 @@ class StubbedKernelsCompile(unittest.TestCase):
         inst = load_installer()
         source = kernel_parse.source()
         variants = [inst.stub_functions(source, ())]
-        variants += [inst.stub_functions(source, (name,)) for name in ("process", "spectralTerm", "init")]
+        variants += [inst.stub_functions(source, (name,)) for name in ("process", "spectral", "lensGhost", "init")]
         with tempfile.TemporaryDirectory() as tmp:
             for i, text in enumerate(variants):
                 path = os.path.join(tmp, "v%d.blink" % i)

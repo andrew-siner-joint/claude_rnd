@@ -1,5 +1,9 @@
 """Render BlinkFlare previews outside Nuke with the C++ harness.
 
+A look is (values, stack): knob values for the node's fixed knobs, and the
+element stack (element dicts, see blinkflare/elements.py).
+
+
     python3 preview.py --preset Default --out flare.png [--width 960 --height 540]
     python3 preview.py --docs ../../docs/previews   # regenerate README images
 """
@@ -16,7 +20,7 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.abspath(os.path.join(HERE, "..", ".."))
 sys.path.insert(0, ROOT)
 
-from blinkflare import camera, spec, presets  # noqa: E402
+from blinkflare import camera, elements, lenses, presets, spec  # noqa: E402
 
 BINARY = os.path.join(HERE, "build", "blinkflare_render")
 
@@ -64,19 +68,36 @@ def dirt_texture(w, h, seed=3):
     return rgba.astype(np.float32)
 
 
-def look_values(preset="Default", overrides=None, w=960, h=540):
+def look(preset="Default", overrides=None, w=960, h=540, stack=None):
+    """(values, stack) for a preset with optional knob overrides."""
+    available = presets.all_presets()
     values = spec.defaults()
-    values.update(presets.PRESETS[preset])
+    values.update(available[preset].get("globals", {}))
     values["light_pos"] = (w * 0.70, h * 0.70)
     values["axis_center"] = (w * 0.5, h * 0.5)
     if overrides:
         values.update(overrides)
-    return values
+    if stack is None:
+        stack = presets.stack(available[preset])
+    return values, stack
 
 
-def render_flare(values, w, h, src=None, occlusion=None, dirt=None, scene=None, verbose=False):
+def table_image(stack, ghosts_for=None):
+    """The element table as float32 (ROWS, columns, 4), row 0 first."""
+    columns = elements.table(stack, ghosts_for)
+    img = np.zeros((elements.ROWS, max(len(columns), 1), 4), np.float32)
+    for i, col in enumerate(columns):
+        for r in range(elements.ROWS):
+            img[r, i] = col[r]
+    return img, len(columns)
+
+
+def render_flare(values, w, h, stack=(), src=None, occlusion=None, dirt=None, scene=None,
+                 verbose=False, ghosts_for=None, element_count=None):
     """Return the kernel output (flare only) as float32 HxWx4, row 0 bottom."""
     params = spec.resolve_params(values, w, h, scene)
+    table, count = table_image(stack, ghosts_for)
+    params["elementCount"] = count if element_count is None else element_count
     with tempfile.TemporaryDirectory() as tmp:
         pfile = os.path.join(tmp, "params.txt")
         with open(pfile, "w") as f:
@@ -84,7 +105,9 @@ def render_flare(values, w, h, src=None, occlusion=None, dirt=None, scene=None, 
                 vals = v if isinstance(v, (tuple, list)) else (v,)
                 f.write("%s %s\n" % (name, " ".join(repr(float(x)) for x in vals)))
         out = os.path.join(tmp, "out.raw")
-        cmd = [BINARY, str(w), str(h), pfile, out]
+        tpath = os.path.join(tmp, "table.raw")
+        table.tofile(tpath)
+        cmd = [BINARY, str(w), str(h), pfile, out, "--elements", tpath, str(table.shape[1])]
         for flag, img in (("--src", src), ("--occlusion", occlusion), ("--dirt", dirt)):
             if img is not None:
                 path = os.path.join(tmp, flag.strip("-") + ".raw")
@@ -105,15 +128,20 @@ def to_display(rgba):
     return Image.fromarray(img[::-1])
 
 
-def render_png(values, w, h, path=None, background=True, **inputs):
+def render_png(values, w, h, path=None, background=True, stack=(), **inputs):
     bg = plate(w, h) if background else None
     inputs.setdefault("src", bg)
-    flare = render_flare(values, w, h, verbose=True, **inputs)
+    flare = render_flare(values, w, h, stack, verbose=True, **inputs)
     comp = flare + inputs["src"] if inputs["src"] is not None else flare
     img = to_display(comp)
     if path:
         img.save(path)
     return img
+
+
+def _label(draw, x, y, text):
+    draw.rectangle((x + 4, y + 4, x + 12 + 6 * len(text), y + 20), fill=(0, 0, 0))
+    draw.text((x + 8, y + 6), text, fill=(235, 235, 235))
 
 
 def contact_sheet(path, w=640, h=360, cols=2):
@@ -122,39 +150,46 @@ def contact_sheet(path, w=640, h=360, cols=2):
     sheet = Image.new("RGB", (cols * w, rows * h), (0, 0, 0))
     draw = ImageDraw.Draw(sheet)
     for i, name in enumerate(names):
-        img = render_png(look_values(name, w=w, h=h), w, h)
+        values, stack = look(name, w=w, h=h)
+        img = render_png(values, w, h, stack=stack)
         x, y = (i % cols) * w, (i // cols) * h
         sheet.paste(img, (x, y))
         _label(draw, x, y, name)
     sheet.save(path)
 
 
-ELEMENTS_OFF = dict(glow_enable=False, glint_enable=False, streak_enable=False, ring_enable=False,
-                    ghost_enable=False, spectral_enable=False)
-ELEMENTS = [
-    ("Glow + Core", dict(glow_enable=True)),
-    ("Glints", dict(glint_enable=True, glint_intensity=1.2)),
-    ("Streaks", dict(streak_enable=True, streak_intensity=1.2)),
-    ("Ring (spectral)", dict(ring_enable=True, ring_intensity=0.15)),
-    ("Ghosts", dict(ghost_enable=True, ghost_intensity=0.3)),
-    ("Spectral Streaks", dict(spectral_enable=True, spectral_intensity=1.0, spectral_length=0.06)),
-]
-
-
-def _label(draw, x, y, text):
-    draw.rectangle((x + 4, y + 4, x + 12 + 6 * len(text), y + 20), fill=(0, 0, 0))
-    draw.text((x + 8, y + 6), text, fill=(235, 235, 235))
-
-
-def element_sheet(path, w=480, h=270, cols=3):
-    rows = (len(ELEMENTS) + cols - 1) // cols
+def element_sheet(path, w=480, h=270, cols=4):
+    """Every element type on its own, at its defaults."""
+    names = elements.TYPE_NAMES
+    rows = (len(names) + cols - 1) // cols
     sheet = Image.new("RGB", (cols * w, rows * h))
     draw = ImageDraw.Draw(sheet)
-    for i, (name, ov) in enumerate(ELEMENTS):
-        values = look_values("Default", dict(ELEMENTS_OFF, **ov), w, h)
+    boost = {"Veil": 3.0, "Iris": 3.0, "Caustic": 2.0}
+    for i, name in enumerate(names):
+        el = elements.element(name)
+        el["intensity"] *= boost.get(name, 1.0)
+        values, _ = look("Default", w=w, h=h)
         x, y = (i % cols) * w, (i // cols) * h
-        sheet.paste(render_png(values, w, h), (x, y))
+        sheet.paste(render_png(values, w, h, stack=[el]), (x, y))
         _label(draw, x, y, name)
+    sheet.save(path)
+
+
+def lens_sheet(path, w=480, h=270):
+    """Lens System ghosts: lens and f-stop (rows) by coating (columns)."""
+    rows = [("Double Gauss 50mm", 2.8), ("Double Gauss 50mm", 8.0), ("Cooke Triplet 50mm", 4.0)]
+    sheet = Image.new("RGB", (len(lenses.COATINGS) * w, len(rows) * h))
+    draw = ImageDraw.Draw(sheet)
+    values, _ = look("Physical 50mm", w=w, h=h)
+    values["light_pos"] = (w * 0.78, h * 0.72)
+    for row, (lens, fstop) in enumerate(rows):
+        for col, coating in enumerate(lenses.COATINGS):
+            stack = [elements.element("Glow", size=0.04, p={"Core Intensity": 8.0}),
+                     elements.element("Lens System", lens=lens, coating=coating, fstop=fstop,
+                                      intensity=0.12 if coating == "Uncoated" else 0.7)]
+            x, y = col * w, row * h
+            sheet.paste(render_png(values, w, h, stack=stack), (x, y))
+            _label(draw, x, y, "%s, f/%g, %s" % (lens, fstop, coating))
     sheet.save(path)
 
 
@@ -170,8 +205,8 @@ def articulation_gif(path, w=480, h=270, frames=36, preset="Default"):
     for f in range(frames):
         a = 2.0 * np.pi * f / frames
         light = (cx + np.cos(a) * w * 0.32, cy + np.sin(a) * h * 0.30)
-        values = look_values(preset, {"light_pos": light, "spin_with_light": True}, w, h)
-        img = render_png(values, w, h).convert("RGB")
+        values, stack = look(preset, {"light_pos": light, "spin_with_light": True}, w, h)
+        img = render_png(values, w, h, stack=stack).convert("RGB")
         draw = ImageDraw.Draw(img)
         _cross(draw, cx, h - cy, (80, 200, 255))
         _cross(draw, light[0], h - light[1], (255, 200, 60))
@@ -179,7 +214,7 @@ def articulation_gif(path, w=480, h=270, frames=36, preset="Default"):
     images[0].save(path, save_all=True, append_images=images[1:], duration=60, loop=0)
 
 
-def camera_gif(path, w=480, h=270, frames=40):
+def camera_gif(path, w=480, h=270, frames=40, preset="Physical 50mm"):
     """A camera panning past a light fixed in world space (3D mode)."""
     images = []
     light = (-30.0, 12.0, -100.0)
@@ -189,8 +224,8 @@ def camera_gif(path, w=480, h=270, frames=40):
             "world_matrix": camera.matrix_trs((0, 2, 0), (4 - 6 * t, 40 - 55 * t, 0)),
             "light_world": light, "focal": 35.0, "haperture": 36.0,
         }
-        values = look_values("Default", {"light_source": 1, "articulation_mode": 2}, w, h)
-        img = render_png(values, w, h, scene=scene).convert("RGB")
+        values, stack = look(preset, {"light_source": 1, "articulation_mode": 2}, w, h)
+        img = render_png(values, w, h, stack=stack, scene=scene).convert("RGB")
         _label(ImageDraw.Draw(img), 0, 0, "3D: camera pan, light at a fixed world position")
         images.append(img)
     images[0].save(path, save_all=True, append_images=images[1:], duration=70, loop=0)
@@ -200,6 +235,7 @@ def docs(folder):
     os.makedirs(folder, exist_ok=True)
     contact_sheet(os.path.join(folder, "presets.png"))
     element_sheet(os.path.join(folder, "elements.png"))
+    lens_sheet(os.path.join(folder, "lenses.png"))
     articulation_gif(os.path.join(folder, "articulation.gif"))
     camera_gif(os.path.join(folder, "camera.gif"))
 
@@ -213,7 +249,7 @@ def main():
     ap.add_argument("--contact-sheet")
     ap.add_argument("--docs", help="render all README images into this folder")
     ap.add_argument("--set", action="append", default=[],
-                    help="override a knob, e.g. --set ghost_count=20")
+                    help="override a knob, e.g. --set anamorphic=0.5")
     args = ap.parse_args()
     build()
     if args.docs:
@@ -226,8 +262,8 @@ def main():
     for item in args.set:
         name, raw = item.split("=", 1)
         overrides[name] = eval(raw)  # trusted local CLI input
-    values = look_values(args.preset, overrides, args.width, args.height)
-    render_png(values, args.width, args.height, args.out or "flare.png")
+    values, stack = look(args.preset, overrides, args.width, args.height)
+    render_png(values, args.width, args.height, args.out or "flare.png", stack=stack)
 
 
 if __name__ == "__main__":

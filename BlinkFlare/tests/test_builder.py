@@ -11,7 +11,7 @@ import nuke_expr
 
 sys.modules["nuke"] = fake_nuke
 
-from blinkflare import builder, camera, compiling, presets, spec  # noqa: E402
+from blinkflare import builder, camera, compiling, elements, presets, spec  # noqa: E402
 
 
 class FakeClock(object):
@@ -78,9 +78,14 @@ class GraphTest(BuilderBase):
         self.assertEqual(inputs.index("mask"), camera.MASK_INPUT)
 
     def test_kernel_wired(self):
-        self.assertEqual(self.blink.maxInputs(), 3)
-        self.assertEqual([self.blink.input(i).name() for i in range(3)],
-                         ["Canvas", "OcclusionDepth", "DirtFit"])
+        self.assertEqual(self.blink.maxInputs(), 4)
+        self.assertEqual([self.blink.input(i).name() for i in range(4)],
+                         ["Canvas", "OcclusionDepth", "DirtFit", "TableRow%d" % (elements.ROWS - 1)])
+        chain = [self.group.child("TableRow%d" % r) for r in range(elements.ROWS)]
+        self.assertEqual(chain[0].input(0).name(), "TableCrop")
+        self.assertEqual(self.group.child("TableCrop").input(0).name(), "TableBase")
+        for prev, row in zip(chain, chain[1:]):
+            self.assertIs(row.input(0), prev)
         occ = self.group.child("OcclusionDepth")
         self.assertEqual((occ["from0"].value(), occ["to0"].value()), ("depth.Z", "rgba.red"))
         mb = self.group.child(spec.MOTION_BLUR_NODE)
@@ -111,7 +116,10 @@ class GraphTest(BuilderBase):
     def test_all_kernel_params_have_expressions(self):
         for param in kernel_parse.declared_params():
             knob = builder.param_knob(self.blink, param)
-            self.assertEqual(sorted(knob.expressions), list(range(knob.channels)), param)
+            if param in spec.BUILDER_PARAMS:
+                self.assertEqual(knob.expressions, {}, param)
+            else:
+                self.assertEqual(sorted(knob.expressions), list(range(knob.channels)), param)
 
     def test_every_expression_reference_resolves(self):
         check_references(self, self.group)
@@ -119,11 +127,17 @@ class GraphTest(BuilderBase):
         check_references(self, self.group)
 
     def test_group_knobs_in_spec_order_with_defaults(self):
-        expected = [k.name for k in spec.KNOBS]
-        self.assertEqual(self.group.user_knob_order, expected)
+        expected = [k.name for k in spec.KNOBS] + ["element_ids", "blinkflare_version"]
+        order = self.group.user_knob_order
+        self.assertEqual(order[:len(expected)], expected)
+        # Then the Default preset's elements, appended to the Elements tab.
+        self.assertTrue(all(n.startswith("e") and n[1].isdigit() for n in order[len(expected):]))
+        self.assertFalse(self.group["element_ids"].visible)
+        self.assertEqual(self.group["blinkflare_version"].value(), spec.VERSION)
+        looks = presets.PRESETS["Default"]["globals"]
         for k in spec.value_knobs():
             if k.kind in ("double", "int", "bool") and k.name != "pixel_aspect":
-                self.assertEqual(self.group[k.name].value(), k.default, k.name)
+                self.assertEqual(self.group[k.name].value(), looks.get(k.name, k.default), k.name)
 
     def test_format_dependent_defaults(self):
         self.assertEqual(self.group["light_pos"].values, [2048 * 0.7, 858 * 0.7])
@@ -147,7 +161,8 @@ class GraphTest(BuilderBase):
 
     def test_newline_flags(self):
         self.assertNotIn(fake_nuke.STARTLINE, self.group["center_light"].flags)
-        self.assertIn(fake_nuke.STARTLINE, self.group["glow_enable"].flags)
+        self.assertIn(fake_nuke.STARTLINE, self.group["light_pos"].flags)
+        self.assertNotIn(fake_nuke.STARTLINE, self.group["e1_type"].flags)
 
     def fresh(self):
         """Start over with no cached kernel."""
@@ -383,13 +398,14 @@ class ElementLayersTest(BuilderBase):
         mb = self.group.child(spec.MOTION_BLUR_NODE)
         switch = self.group.child(spec.SWITCH_NODE)
         prev_stream, prev_comp = self.blink, self.group.child(spec.MERGE_NODE)
-        for index, name, layer in spec.ELEMENTS:
+        for index, name, layer in spec.PASSES:
+            name = name.lower()
             inst = self.group.child("%s_%s" % (spec.KERNEL_NODE, name))
-            solo = builder.param_knob(inst, "soloElement")
+            solo = builder.param_knob(inst, "soloPass")
             self.assertEqual((solo.value(), solo.expressions), (index, {}))
             self.assertEqual(inst["disable"].expressions[0], "1 - parent.element_layers")
-            self.assertEqual([inst.input(i).name() for i in range(3)],
-                             ["Canvas", "OcclusionDepth", "DirtFit"])
+            self.assertEqual([inst.input(i) for i in range(4)],
+                             [self.blink.input(i) for i in range(4)])
             stream = self.group.child("Layer_" + name)
             comp = self.group.child("CompLayer_" + name)
             self.assertEqual([stream.input(0), stream.input(1)], [prev_stream, inst])
@@ -411,65 +427,333 @@ class ElementLayersTest(BuilderBase):
         self.fire("element_layers")
         self.assertIsNone(self.group.child(spec.KERNEL_NODE + "_glow"))
 
+    def test_layer_kernels_follow_the_stack(self):
+        builder.build_element_layers(self.group)
+        builder.add_element(self.group, "Streak")
+        count = builder.param_knob(self.blink, "elementCount").value()
+        for _, name, _ in spec.PASSES:
+            inst = self.group.child("%s_%s" % (spec.KERNEL_NODE, name.lower()))
+            self.assertEqual(builder.param_knob(inst, "elementCount").value(), count, name)
+
 
 class PresetTest(BuilderBase):
-    def test_apply_preset_resets_look_only(self):
+    def types(self):
+        return [el["type"] for el in builder.stack(self.group)]
+
+    def test_default_preset_applied_on_create(self):
+        want = presets.stack(presets.PRESETS["Default"])
+        self.assertEqual(self.types(), [el["type"] for el in want])
+        for got, el in zip(builder.stack(self.group), want):
+            self.assertEqual(elements.knob_values(got), elements.knob_values(el))
+
+    def test_apply_preset_replaces_look_and_stack(self):
         self.group["light_pos"].setValue([10.0, 20.0])
-        self.group["ghost_count"].setValue(40)
-        self.group["streak_intensity"].animated = True
-        builder.apply_preset(self.group, "Anamorphic Blue")
-        p = presets.PRESETS["Anamorphic Blue"]
+        self.group["anamorphic"].animated = True
+        builder.apply_preset(self.group, "Classic Anamorphic")
+        p = presets.PRESETS["Classic Anamorphic"]
         self.assertEqual(self.group["light_pos"].values, [10.0, 20.0])
-        self.assertEqual(self.group["ghost_count"].value(), p["ghost_count"])
-        self.assertEqual(self.group["streak_intensity"].value(), p["streak_intensity"])
-        self.assertFalse(self.group["streak_intensity"].isAnimated())
-        self.assertEqual(self.group["streak_color"].values, list(p["streak_color"]))
+        self.assertEqual(self.types(), [el["type"] for el in presets.stack(p)])
+        self.assertEqual(self.group["anamorphic"].value(), p["globals"]["anamorphic"])
+        self.assertFalse(self.group["anamorphic"].isAnimated())
         builder.apply_preset(self.group, "Default")
-        self.assertEqual(self.group["ghost_count"].value(), spec.knob("ghost_count").default)
-        self.assertEqual(fake_nuke.Undo.log[-1], ("end", ""))
+        self.assertEqual(self.group["anamorphic"].value(), spec.knob("anamorphic").default)
+        self.assertEqual(self.types(), [el["type"] for el in presets.stack(presets.PRESETS["Default"])])
+        # Element edits stay out of the undo history (Nuke can't undo knob
+        # additions, so undoing just the values would break the stack).
+        self.assertEqual(fake_nuke.Undo.log[-1], ("enable", ""))
+        self.assertFalse(fake_nuke.Undo._disabled[0])
+        # Knobs of replaced elements are gone; ids restart.
+        n = len(presets.stack(presets.PRESETS["Default"]))
+        self.assertEqual(builder.element_ids(self.group), list(range(1, n + 1)))
+        self.assertIsNone(self.group.knob("e%d_on" % (n + 1)))
 
     def test_apply_preset_from_menu(self):
-        self.group["preset"].setValue("Sun Starburst")
+        self.group["preset"].setValue("Golden Hour Sun")
         builder.apply_preset(self.group)
-        self.assertEqual(self.group["glint_count"].value(),
-                         presets.PRESETS["Sun Starburst"]["glint_count"])
+        self.assertEqual(self.types(),
+                         [el["type"] for el in presets.stack(presets.PRESETS["Golden Hour Sun"])])
 
     def test_save_then_apply(self):
-        self.group["ghost_count"].setValue(23)
-        self.group["glow_color"].setValue([0.1, 0.2, 0.3])
+        self.group["dust"].setValue(0.77)
         self.group["light_source"].setValue(1)
+        builder.clear_elements(self.group)
+        builder.add_element(self.group, "Streak", elements.element("Streak", color=(0.1, 0.2, 0.3)))
+        builder.add_element(self.group, "Lens System",
+                            elements.element("Lens System", fstop=8.0, coating="Uncoated"))
         fake_nuke.inputs_queue.append("Show Look")
         path = builder.save_preset(self.group)
         with open(path) as f:
             data = json.load(f)
         self.assertEqual(data["name"], "Show Look")
-        self.assertEqual(data["knobs"]["ghost_count"], 23)
-        self.assertNotIn("light_source", data["knobs"])
+        self.assertEqual(data["globals"]["dust"], 0.77)
+        self.assertNotIn("light_source", data["globals"])
+        self.assertEqual([e["type"] for e in data["elements"]], ["Streak", "Lens System"])
         self.assertIn("Show Look", self.group["preset"].items)
         self.assertEqual(self.group["preset"].value(), "Show Look")
 
         builder.apply_preset(self.group, "Default")
         builder.apply_preset(self.group, "Show Look")
-        self.assertEqual(self.group["ghost_count"].value(), 23)
-        self.assertEqual(self.group["glow_color"].values, [0.1, 0.2, 0.3])
+        self.assertEqual(self.group["dust"].value(), 0.77)
+        self.assertEqual(self.types(), ["Streak", "Lens System"])
+        self.assertEqual(self.group["e1_color"].values, [0.1, 0.2, 0.3])
+        self.assertEqual(self.group["e2_fstop"].value(), 8.0)
+        self.assertEqual(self.group["e2_coating"].value(), "Uncoated")
 
     def test_cannot_overwrite_builtin(self):
         with self.assertRaises(ValueError):
             builder.save_preset(self.group, "Default")
 
     def test_show_panel_refreshes_menu(self):
-        presets.write_preset("From Disk", {"ghost_count": 3})
+        presets.write_preset("From Disk", {"dust": 0.2}, [elements.element("Glow")])
         self.fire("showPanel")
         self.assertIn("From Disk", self.group["preset"].items)
+
+    def test_show_panel_restores_element_ui(self):
+        eid = builder.element_ids(self.group)[0]
+        for name, knob in self.group.knobs().items():
+            if name.startswith("e%d_" % eid):
+                knob.setVisible(True)
+                knob.setLabel(name)
+        self.fire("showPanel")
+        t = elements.TYPES[self.group["e%d_type" % eid].value()]
+        self.assertEqual(self.group["e%d_begin" % eid].label, "1. " + t.name)
+        self.assertEqual(self.group["e%d_p0" % eid].label, t.params[0].label)
+        self.assertFalse(self.group["e%d_p7" % eid].visible)
+        self.assertFalse(self.group["e%d_fstop" % eid].visible)
+
+    def test_ids_survive_an_out_of_sync_stack(self):
+        # e.g. after an undo restored element_ids but not the removed knobs.
+        ids = builder.element_ids(self.group)
+        builder.remove_element(self.group, ids[0])
+        self.group["element_ids"].setValue(",".join(str(i) for i in ids) + ",x,%d" % ids[1])
+        self.assertEqual(builder.element_ids(self.group), ids[1:])
+        # Orphaned knobs (id missing from the list) never collide with new ones.
+        self.group["element_ids"].setValue(str(ids[1]))
+        eid = builder.add_element(self.group, "Glow")
+        self.assertGreater(eid, max(ids))
+        builder.rebuild_table(self.group)
+
+    def test_older_nodes_are_refused(self):
+        self.group.removeKnob(self.group["element_ids"])
+        for call in (lambda: builder.apply_preset(self.group, "Default"),
+                     lambda: builder.add_element(self.group, "Glow"),
+                     lambda: builder.save_preset(self.group, "x")):
+            with self.assertRaises(builder.BuildError):
+                call()
+
+
+def evaluate_table(group):
+    """Run the TableRow Expression chain over the table's pixels."""
+    width = int(group.child("TableCrop")["box"].value(2))
+    rows = [group.child("TableRow%d" % r) for r in range(elements.ROWS)]
+    columns = []
+    for x in range(width):
+        column = []
+        for y in range(elements.ROWS):
+            pixel = [0.0, 0.0, 0.0, 0.0]  # TableBase is black
+            for row in rows:
+                env = {"x": float(x), "y": float(y)}
+                env.update(zip(elements.CHANNEL_VARS, pixel))
+
+                def resolve(path):
+                    if path in env:
+                        return env[path]
+                    parts = path.split(".")
+                    assert parts[0] == "parent", path
+                    return fake_nuke._knob_number(group[parts[1]], parts[2] if len(parts) > 2 else None)
+                pixel = [nuke_expr.evaluate(row["expr%d" % c].value(), resolve) for c in range(4)]
+            column.append(tuple(pixel))
+        columns.append(column)
+    return columns
+
+
+class ElementStackTest(BuilderBase):
+    def assertTableMatches(self, places=9):
+        got = evaluate_table(self.group)
+        want = elements.table(builder.stack(self.group))
+        self.assertEqual(len(got), max(len(want), 1))
+        self.assertEqual(builder.param_knob(self.blink, "elementCount").value(), len(want))
+        for x, (g, w) in enumerate(zip(got, want)):
+            for r in range(elements.ROWS):
+                for c in range(4):
+                    self.assertAlmostEqual(g[r][c], w[r][c], places=places, msg=(x, r, c))
+
+    def test_table_matches_the_stack(self):
+        self.assertTableMatches()
+
+    def test_table_follows_knob_edits_without_rebuilding(self):
+        self.group["e1_intensity"].setValue(1.75)
+        self.group["e2_color"].setValue([0.2, 0.4, 0.6])
+        self.group["e3_p2"].setValue(4.5)
+        self.group["e4_on"].setValue(False)
+        self.group["e5_layer"].setValue(elements.PASS_CODES["Other"])
+        self.assertTableMatches()
+
+    def test_lens_system_table(self):
+        builder.add_element(self.group, "Lens System",
+                            elements.element("Lens System", fstop=4.0, max_ghosts=6))
+        self.assertTableMatches()
+        eid = builder.element_ids(self.group)[-1]
+        # Live: size and brightness knobs drive the baked ghosts directly.
+        self.group["e%d_size" % eid].setValue(1.3)
+        self.group["e%d_dispersion" % eid].setValue(0.25)
+        self.group["e%d_color" % eid].setValue([1.0, 0.5, 0.2])
+        self.assertTableMatches()
+
+    def test_empty_stack(self):
+        builder.clear_elements(self.group)
+        self.assertEqual(builder.element_ids(self.group), [])
+        self.assertEqual(builder.param_knob(self.blink, "elementCount").value(), 0)
+        self.assertTableMatches()
+        self.assertEqual([k for k in self.group.knobs() if k[:1] == "e" and k[1:2].isdigit()], [])
+
+    def test_add_element(self):
+        before = builder.element_ids(self.group)
+        eid = builder.add_element(self.group, "Streak")
+        self.assertEqual(builder.element_ids(self.group), before + [eid])
+        self.assertEqual(eid, max(before) + 1)
+        t = elements.TYPES["Streak"]
+        self.assertEqual(self.group["e%d_begin" % eid].label, "%d. Streak" % len(before + [eid]))
+        self.assertEqual(self.group["e%d_begin" % eid].flag, fake_nuke.TABBEGINCLOSEDGROUP)
+        self.assertEqual(self.group["e%d_end" % eid].flag, fake_nuke.TABENDGROUP)
+        self.assertEqual(self.group["e%d_size" % eid].label, "Length")
+        for i in range(8):
+            knob = self.group["e%d_p%d" % (eid, i)]
+            self.assertEqual(knob.visible, i < len(t.params), i)
+            if i < len(t.params):
+                self.assertEqual(knob.label, t.params[i].label)
+                self.assertEqual(knob.value(), t.params[i].default)
+                self.assertEqual(knob.range, (t.params[i].lo, t.params[i].hi))
+        self.assertFalse(self.group["e%d_softness" % eid].visible)
+        for field in elements.LENS_FIELDS:
+            self.assertFalse(self.group["e%d_%s" % (eid, field)].visible, field)
+        self.assertEqual(elements.knob_values(builder.element_values(self.group, eid)),
+                         elements.knob_values(elements.element("Streak")))
+        self.assertTableMatches()
+
+    def test_add_from_the_panel(self):
+        self.group["add_type"].setValue("Caustic")
+        fake_nuke.run_script(self.group["add_element"].script, self.group)
+        self.assertEqual(builder.stack(self.group)[-1]["type"], "Caustic")
+
+    def test_remove_element_renumbers_headers(self):
+        ids = builder.element_ids(self.group)
+        builder.remove_element(self.group, ids[1])
+        self.assertEqual(builder.element_ids(self.group), [ids[0]] + ids[2:])
+        self.assertIsNone(self.group.knob("e%d_on" % ids[1]))
+        third = self.group["e%d_begin" % ids[2]].label
+        self.assertTrue(third.startswith("2. "), third)
+        self.assertTableMatches()
+
+    def test_delete_button(self):
+        eid = builder.element_ids(self.group)[0]
+        fake_nuke.run_script(self.group["e%d_del" % eid].script, self.group)
+        self.assertNotIn(eid, builder.element_ids(self.group))
+
+    def test_duplicate_copies_values_and_animation(self):
+        eid = builder.element_ids(self.group)[2]
+        self.group["e%d_intensity" % eid].setValueAt(0.5, 1)
+        self.group["e%d_intensity" % eid].setValueAt(2.0, 10)
+        self.group["e%d_p1" % eid].setExpression("frame / 10")
+        new = builder.duplicate_element(self.group, eid)
+        self.assertEqual(builder.element_ids(self.group)[-1], new)
+        self.assertEqual(elements.knob_values(builder.element_values(self.group, new)),
+                         elements.knob_values(builder.element_values(self.group, eid)))
+        self.assertEqual(self.group["e%d_intensity" % new].keys, {0: {1.0: 0.5, 10.0: 2.0}})
+        self.assertEqual(self.group["e%d_p1" % new].expressions, {0: "frame / 10"})
+        self.assertTableMatches()
+
+    def test_duplicate_button(self):
+        eid = builder.element_ids(self.group)[0]
+        count = len(builder.element_ids(self.group))
+        fake_nuke.run_script(self.group["e%d_dup" % eid].script, self.group)
+        self.assertEqual(len(builder.element_ids(self.group)), count + 1)
+
+    def test_type_change_resets_values_and_relabels(self):
+        eid = builder.element_ids(self.group)[0]
+        self.group["e%d_p0" % eid].setValueAt(3.0, 5)
+        self.group["e%d_layer" % eid].setValue(3)
+        self.group["e%d_type" % eid].setValue("Ring")
+        self.fire("e%d_type" % eid)
+        ring = elements.element("Ring", layer=3)
+        self.assertEqual(elements.knob_values(builder.element_values(self.group, eid)),
+                         elements.knob_values(ring))
+        self.assertFalse(self.group["e%d_p0" % eid].isAnimated())
+        self.assertEqual(self.group["e%d_p0" % eid].label, "Thickness")
+        self.assertEqual(self.group["e%d_size" % eid].label, "Radius")
+        self.assertFalse(self.group["e%d_p2" % eid].visible)
+        self.assertTrue(self.group["e%d_begin" % eid].label.endswith("Ring"))
+        self.assertTableMatches()
+
+    def test_change_to_and_from_lens_system(self):
+        eid = builder.element_ids(self.group)[0]
+        self.group["e%d_type" % eid].setValue("Lens System")
+        self.fire("e%d_type" % eid)
+        self.assertTrue(self.group["e%d_fstop" % eid].visible)
+        self.assertGreater(builder.param_knob(self.blink, "elementCount").value(),
+                           len(builder.element_ids(self.group)))
+        self.assertTableMatches()
+        self.group["e%d_type" % eid].setValue("Glow")
+        self.fire("e%d_type" % eid)
+        self.assertFalse(self.group["e%d_fstop" % eid].visible)
+        self.assertTableMatches()
+
+    def test_lens_changes_rebake(self):
+        builder.clear_elements(self.group)
+        eid = builder.add_element(self.group, "Lens System",
+                                  elements.element("Lens System", max_ghosts=10))
+        count = builder.param_knob(self.blink, "elementCount")
+        self.assertEqual(count.value(), 10)
+        self.group["e%d_max_ghosts" % eid].setValue(4)
+        self.fire("e%d_max_ghosts" % eid)
+        self.assertEqual(count.value(), 4)
+        before = self.group.child("TableRow0")["expr2"].value()
+        self.group["e%d_lens" % eid].setValue("Cooke Triplet 50mm")
+        self.fire("e%d_lens" % eid)
+        self.assertNotEqual(self.group.child("TableRow0")["expr2"].value(), before)
+        self.assertTableMatches()
+        # Other knobs are read live by the expressions: no rebuild needed.
+        before = self.group.child("TableRow0")["expr2"].value()
+        self.group["e%d_intensity" % eid].setValue(0.3)
+        self.fire("e%d_intensity" % eid)
+        self.assertEqual(self.group.child("TableRow0")["expr2"].value(), before)
+
+    def test_bad_lens_file_gives_no_ghosts(self):
+        builder.clear_elements(self.group)
+        el = elements.element("Lens System", lens="From File",
+                              lens_file=os.path.join(self.tmp.name, "missing.dat"))
+        builder.add_element(self.group, "Lens System", el)
+        self.assertEqual(builder.param_knob(self.blink, "elementCount").value(), 0)
+
+    def test_table_is_capped(self):
+        builder.clear_elements(self.group)
+        for _ in range(elements.MAX_COLUMNS + 5):
+            builder.add_element(self.group, "Glow", rebuild=False)
+        builder.rebuild_table(self.group)
+        self.assertEqual(builder.param_knob(self.blink, "elementCount").value(), elements.MAX_COLUMNS)
+        self.assertEqual(self.group.child("TableCrop")["box"].value(2), elements.MAX_COLUMNS)
+
+    def test_clear_button_asks_first(self):
+        fake_nuke.asks_queue.append(False)
+        fake_nuke.run_script(self.group["clear_elements"].script, self.group)
+        self.assertTrue(builder.element_ids(self.group))
+        fake_nuke.asks_queue.append(True)
+        fake_nuke.run_script(self.group["clear_elements"].script, self.group)
+        self.assertEqual(builder.element_ids(self.group), [])
 
 
 def check_references(test, group):
     """Every knob reference in every expression in ``group`` must resolve."""
     nodes = dict((c.name(), c) for c in group.children())
     for node in [group] + group.children():
-        for knob_name, knob in node.knobs().items():
-            for expr in knob.expressions.values():
+        exprs = [(name, e) for name, knob in node.knobs().items() for e in knob.expressions.values()]
+        if node.Class() == "Expression":  # per-pixel expressions live in the expr knobs
+            exprs += [("expr%d" % c, node["expr%d" % c].value()) for c in range(4)]
+        for knob_name, expr in exprs:
+            if True:
                 for ref in nuke_expr.references(expr):
+                    if node.Class() == "Expression" and ref in ("x", "y") + elements.CHANNEL_VARS:
+                        continue
                     parts = ref.split(".")
                     where = "%s.%s: %s" % (node.name(), knob_name, ref)
                     if parts[0] == "input":

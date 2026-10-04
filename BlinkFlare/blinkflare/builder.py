@@ -3,8 +3,9 @@
 Node graph inside the group:
 
     src ── SrcChannels ── Canvas (Crop to format) ─────────────────┐
-    occlusion ── OcclusionChannels ── OcclusionDepth (depth→red) ──┼── FlareKernel ── [element layers] ── MotionBlur ──┐
-    dirt ── DirtChannels ── DirtFit (Reformat fill) ───────────────┘                                                  │
+    occlusion ── OcclusionChannels ── OcclusionDepth (depth→red) ──┤
+    dirt ── DirtChannels ── DirtFit (Reformat fill) ───────────────┼── FlareKernel ── [element layers] ── MotionBlur ──┐
+    TableBase ── TableCrop ── TableRow0..5 (Expressions) ──────────┘                                                  │
     cam ── CameraXform (Axis) ┐                                                                                       │
     axis ── LightXform (Axis) ┴── Projection (NoOp, expressions only)                                                  │
     src ─────────────────── Composite (Merge, B) ── A ────────────────────────────────────────────────────────────────┤
@@ -15,17 +16,23 @@ mix and mask behave like any Nuke merge and the source alpha passes through.
 Element Layers adds one solo kernel per element plus Copy nodes, built the
 first time it is switched on.
 
+The flare's elements are knobs added at runtime (e<id>_<field>, one
+collapsible group each). The TableRow Expression nodes turn them into the
+small table image the kernel reads (see elements.py); adding, removing or
+re-typing an element rewrites those expressions.
+
 Kernels are never compiled while a node is being built: the first create()
 compiles once in the background (see compiling.py) and caches the compiled
 node; every kernel after that is a paste of it.
 """
 
 import os
+import re
 import traceback
 
 import nuke
 
-from blinkflare import camera, compiling, presets, spec
+from blinkflare import camera, compiling, elements, lenses, presets, spec
 
 KERNEL_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "kernel", "BlinkFlare.blink")
 
@@ -166,7 +173,7 @@ def make_kernel(name, inputs, template, solo=None):
         blink.setInput(i, node)
     link_kernel_params(blink)
     if solo is not None:
-        knob = param_knob(blink, "soloElement")
+        knob = param_knob(blink, "soloPass")
         knob.clearAnimated()
         knob.setValue(solo)
     return blink
@@ -269,6 +276,11 @@ def add_group_knobs(group, fmt):
         group.addKnob(knob)
         if k.is_value:
             set_knob_value(knob, k, values[k.name])
+    for name, value in (("element_ids", ""), ("blinkflare_version", spec.VERSION)):
+        knob = nuke.String_Knob(name, name)
+        group.addKnob(knob)
+        knob.setValue(value)
+        knob.setVisible(False)
     group["knobChanged"].setValue(knob_changed)
 
 
@@ -324,6 +336,28 @@ def build_projection(canvas, cam_in, axis_in):
     return proj
 
 
+def build_table_nodes():
+    """Constant -> Crop -> six chained Expression nodes, one per table row.
+    Returns the last one (the table image)."""
+    base = nuke.nodes.Constant(name="TableBase")
+    base.setXYpos(1100, 0)
+    crop = nuke.nodes.Crop(name="TableCrop", inputs=[base])
+    box = crop["box"]
+    for i, v in enumerate((0, 0, 1, elements.ROWS)):
+        box.setValue(v, i)
+    crop["reformat"].setValue(False)
+    crop["crop"].setValue(False)
+    crop.setXYpos(1100, 60)
+    prev = crop
+    for r in range(elements.ROWS):
+        row = nuke.nodes.Expression(name="TableRow%d" % r, inputs=[prev])
+        for c in range(4):
+            row["expr%d" % c].setValue(elements.row_expression([], r, c))
+        row.setXYpos(1100, 120 + 40 * r)
+        prev = row
+    return prev
+
+
 def build_internals(group, template):
     """Create the node graph inside ``group``. Returns the main kernel."""
     with group:
@@ -370,8 +404,9 @@ def build_internals(group, template):
         dirt.setXYpos(440, 160)
 
         build_projection(canvas, ins["cam"], ins["axis"])
+        table = build_table_nodes()
 
-        blink = make_kernel(spec.KERNEL_NODE, [canvas, occ, dirt], template)
+        blink = make_kernel(spec.KERNEL_NODE, [canvas, occ, dirt, table], template)
         if blink.knob("useGPUIfAvailable") is not None:
             blink["useGPUIfAvailable"].setValue(True)
         blink.setXYpos(220, 260)
@@ -406,6 +441,7 @@ def build_group(sel, fmt, template):
         group["tile_color"].setValue(0xE8A33DFF)
         build_internals(group, template)
         add_group_knobs(group, fmt)
+        apply_preset(group, list(presets.PRESETS)[0])
     except Exception:
         nuke.delete(group)
         raise
@@ -482,7 +518,7 @@ def build_element_layers(group):
     Built on demand because every extra kernel has to compile. Safe to call
     again; it does nothing once the layers exist.
     """
-    first = spec.ELEMENTS[0][1]
+    first = spec.PASSES[0][1].lower()
     if group.node("%s_%s" % (spec.KERNEL_NODE, first)) is not None:
         return
     main = group.node(spec.KERNEL_NODE)
@@ -493,11 +529,12 @@ def build_element_layers(group):
     with group:
         mb = group.node(spec.MOTION_BLUR_NODE)
         switch = group.node(spec.SWITCH_NODE)
-        inputs = [main.input(i) for i in range(3)]
+        inputs = [main.input(i) for i in range(4)]
         prev_stream = main
         prev_comp = group.node(spec.MERGE_NODE)
         off = "1 - parent.element_layers"
-        for i, (index, name, layer) in enumerate(spec.ELEMENTS):
+        for i, (index, name, layer) in enumerate(spec.PASSES):
+            name = name.lower()
             if layer not in nuke.layers():
                 nuke.Layer(layer, ["%s.%s" % (layer, c) for c in RGBA])
             inst = make_kernel("%s_%s" % (spec.KERNEL_NODE, name), inputs, template, solo=index)
@@ -569,30 +606,41 @@ def bake_to_2d(node, frames=None):
 
 # ------------------------------------------------------------------ presets
 
+def _require_v3(node):
+    if node.knob("element_ids") is None:
+        raise BuildError("This node was made with an older BlinkFlare. Create a new BlinkFlare "
+                         "node to use element stacks and v3 presets.")
+
+
+def look_knobs():
+    """Static knobs a preset sets (everything that isn't placement/pipeline)."""
+    return [k for k in spec.value_knobs() if k.name not in spec.NON_LOOK_KNOBS]
+
+
 def apply_preset(node, name=None):
-    """Reset the look knobs of ``node`` to a preset (undoable)."""
+    """Replace the node's look and element stack with a preset."""
+    _require_v3(node)
     if name is None:
         name = node["preset"].value()
     available = presets.all_presets()
     if name not in available:
         raise KeyError("Unknown BlinkFlare preset %r" % name)
+    preset = available[name]
     values = spec.defaults()
-    values.update(available[name])
+    values.update(preset.get("globals", {}))
 
-    undo = nuke.Undo()
-    undo.begin("BlinkFlare preset: " + name)
-    try:
-        for k in spec.value_knobs():
-            if k.name in spec.NON_LOOK_KNOBS or values[k.name] is None:
-                continue
+    with _NoUndo():
+        for k in look_knobs():
             knob = node.knob(k.name)
-            if knob is None:
+            if knob is None or values[k.name] is None:
                 continue
             if knob.isAnimated():
                 knob.clearAnimated()
             set_knob_value(knob, k, values[k.name])
-    finally:
-        undo.end()
+        clear_elements(node, rebuild=False)
+        for el in presets.stack(preset):
+            add_element(node, el["type"], el, rebuild=False)
+        rebuild_table(node)
 
 
 def refresh_presets(node, select=None):
@@ -606,19 +654,323 @@ def refresh_presets(node, select=None):
         knob.setValue(current)
 
 
+def refresh_panel(node):
+    """Preset menu and element knob labels/visibility, re-applied whenever
+    the panel opens (so they don't depend on what the script file kept)."""
+    refresh_presets(node)
+    if node.knob("element_ids") is not None:
+        _renumber(node)
+
+
 def save_preset(node, name=None):
-    """Save the current look of ``node`` as a preset file."""
+    """Save the node's look and element stack as a preset file."""
+    _require_v3(node)
     if name is None:
         name = nuke.getInput("Preset name", "")
         if not name:
             return None
     values = {}
-    for k in spec.value_knobs():
-        if k.name not in spec.NON_LOOK_KNOBS and node.knob(k.name) is not None:
+    for k in look_knobs():
+        if node.knob(k.name) is not None:
             values[k.name] = get_knob_value(node[k.name], k)
-    path = presets.write_preset(name, values)
+    path = presets.write_preset(name, values, stack(node))
     refresh_presets(node, select=name)
     return path
+
+
+# ----------------------------------------------------------------- elements
+
+def element_ids(node):
+    """Ids of the node's elements, in order (ignoring any whose knobs are gone)."""
+    ids = []
+    for v in node["element_ids"].value().split(","):
+        v = v.strip()
+        if v.isdigit() and int(v) not in ids and node.knob(elements.knob_name(int(v), "type")):
+            ids.append(int(v))
+    return ids
+
+
+def _next_id(node):
+    used = [int(m.group(1)) for m in (re.match(r"e(\d+)_", n) for n in node.knobs()) if m]
+    return max(used + element_ids(node) + [0]) + 1
+
+
+class _NoUndo(object):
+    """Keeps element edits out of Nuke's undo history. Nuke can't undo added
+    or removed knobs, so undoing only the values would leave the stack
+    inconsistent."""
+
+    def __enter__(self):
+        try:
+            self.undo = nuke.Undo()
+            self.was_disabled = bool(self.undo.disabled())
+        except (AttributeError, RuntimeError):
+            self.undo, self.was_disabled = None, False
+        if self.undo is not None and not self.was_disabled:
+            self.undo.disable()
+        return self
+
+    def __exit__(self, *exc):
+        if self.undo is not None and not self.was_disabled:
+            self.undo.enable()
+        return False
+
+
+def _set_element_ids(node, ids):
+    node["element_ids"].setValue(",".join(str(i) for i in ids))
+
+
+def _tab_flag(name, fallback):
+    return getattr(nuke, name, fallback)
+
+
+def _element_knobs(eid):
+    """(field, knob) for a new element's knobs, in panel order."""
+    k = lambda f: elements.knob_name(eid, f)  # noqa: E731
+    out = [("begin", nuke.Tab_Knob(k("begin"), "", _tab_flag("TABBEGINCLOSEDGROUP", 2))),
+           ("on", nuke.Boolean_Knob(k("on"), "Enable")),
+           ("type", nuke.Enumeration_Knob(k("type"), "", elements.TYPE_NAMES)),
+           ("layer", nuke.Enumeration_Knob(k("layer"), "Layer", elements.LAYER_ITEMS)),
+           ("dup", nuke.PyScript_Knob(k("dup"), "Duplicate",
+                                      "import blinkflare\nblinkflare.duplicate_element("
+                                      "nuke.thisNode(), %d)\n" % eid)),
+           ("del", nuke.PyScript_Knob(k("del"), "Delete",
+                                      "import blinkflare\nblinkflare.remove_element("
+                                      "nuke.thisNode(), %d, later=True)\n" % eid)),
+           ("intensity", nuke.Double_Knob(k("intensity"), "Intensity")),
+           ("color", nuke.Color_Knob(k("color"), "Color")),
+           ("size", nuke.Double_Knob(k("size"), "Size")),
+           ("axis", nuke.Double_Knob(k("axis"), "Axis Position")),
+           ("rotation", nuke.Double_Knob(k("rotation"), "Rotation")),
+           ("seed", nuke.Int_Knob(k("seed"), "Seed")),
+           ("dispersion", nuke.Double_Knob(k("dispersion"), "Dispersion")),
+           ("softness", nuke.Double_Knob(k("softness"), "Softness"))]
+    out += [("p%d" % i, nuke.Double_Knob(k("p%d" % i), "p%d" % i)) for i in range(8)]
+    out += [("lens", nuke.Enumeration_Knob(k("lens"), "Lens", lenses.lens_names())),
+            ("lens_file", nuke.File_Knob(k("lens_file"), "Lens File")),
+            ("fstop", nuke.Double_Knob(k("fstop"), "f-stop")),
+            ("coating", nuke.Enumeration_Knob(k("coating"), "Coating", lenses.COATINGS)),
+            ("max_ghosts", nuke.Int_Knob(k("max_ghosts"), "Max Ghosts")),
+            ("sensor", nuke.Double_Knob(k("sensor"), "Sensor Height (mm)")),
+            ("end", nuke.Tab_Knob(k("end"), "", _tab_flag("TABENDGROUP", -1)))]
+    return out
+
+
+GENERIC_RANGES = {"intensity": (0.0, 2.0), "size": (0.0, 1.0), "axis": (-1.0, 3.0),
+                  "rotation": (-180.0, 180.0), "dispersion": (0.0, 1.0), "softness": (0.0, 1.0)}
+SAME_LINE = ("type", "layer", "dup", "del")
+LENS_TIPS = {
+    "lens": "Lens design. Ghosts come from its real surfaces, so more air-glass surfaces "
+            "mean more ghosts: the Achromat (two cemented elements) is nearly flare-free. "
+            "Add your own as PBRT-format .dat files in a folder on BLINKFLARE_LENS_PATH, "
+            "or pick From File.",
+    "fstop": "Ghost size follows the entrance pupil (1 / f-stop). Long lenses at wide "
+             "apertures give huge, faint ghosts; stop down to see them.",
+    "coating": "Single coated: purple/magenta ghosts. Multi coated: fainter, varied tints. "
+               "Uncoated: bright, neutral ghosts.",
+    "max_ghosts": "Keeps the most visible ghosts (every surface pair gives one).",
+    "sensor": "Sensor (frame) height in mm; sets ghost size relative to the frame.",
+}
+
+
+def _set_element_value(knob, field, value):
+    if field == "color":
+        knob.setValue([float(c) for c in value])
+    elif field in ("on",):
+        knob.setValue(bool(value))
+    elif field in ("type", "layer", "seed", "max_ghosts"):
+        knob.setValue(int(value))
+    elif field in ("lens", "coating"):
+        try:
+            knob.setValue(value)
+        except (ValueError, RuntimeError):
+            knob.setValue(0)  # e.g. a lens file that isn't on this machine
+    elif field == "lens_file":
+        knob.setValue(str(value))
+    else:
+        knob.setValue(float(value))
+
+
+def add_element(node, type_name, values=None, rebuild=True):
+    """Add an element of ``type_name`` (with optional element dict values)."""
+    _require_v3(node)
+    el = dict(values) if values else elements.element(type_name)
+    el["type"] = type_name
+    ids = element_ids(node)
+    eid = _next_id(node)
+    knob_values = elements.knob_values(elements.element(type_name, **_overrides(el)))
+    with _NoUndo():
+        for field, knob in _element_knobs(eid):
+            if field in GENERIC_RANGES:
+                knob.setRange(*GENERIC_RANGES[field])
+            if field in LENS_TIPS:
+                knob.setTooltip(LENS_TIPS[field])
+            node.addKnob(knob)
+            if field in SAME_LINE:
+                knob.clearFlag(nuke.STARTLINE)
+            if field in knob_values:
+                _set_element_value(knob, field, knob_values[field])
+        _set_element_ids(node, ids + [eid])
+        apply_type_ui(node, eid)
+        if rebuild:
+            rebuild_table(node)
+    return eid
+
+
+def _overrides(el):
+    """The element dict minus 'type' (for elements.element)."""
+    out = dict(el)
+    out.pop("type", None)
+    return out
+
+
+def remove_element(node, eid, rebuild=True, later=False):
+    """Remove element ``eid``. ``later`` defers it to the next event-loop
+    turn, for the element's own Delete button (whose knob it removes)."""
+    _require_v3(node)
+    if later:
+        compiling.later(0, lambda: remove_element(node, eid, rebuild))
+        return
+    prefix = "e%d_" % eid
+    with _NoUndo():
+        for name in [n for n in node.knobs() if n.startswith(prefix)]:
+            node.removeKnob(node[name])
+        _set_element_ids(node, [i for i in element_ids(node) if i != eid])
+        if rebuild:
+            rebuild_table(node)
+
+
+def clear_elements(node, rebuild=True):
+    for eid in element_ids(node):
+        remove_element(node, eid, rebuild=False)
+    if rebuild:
+        rebuild_table(node)
+
+
+def duplicate_element(node, eid):
+    """Copy an element, keyframes and expressions included."""
+    el = element_values(node, eid)
+    with _NoUndo():
+        new = add_element(node, el["type"], el, rebuild=False)
+        for field in elements.VALUE_FIELDS:
+            src = node.knob(elements.knob_name(eid, field))
+            dst = node.knob(elements.knob_name(new, field))
+            if src is not None and dst is not None and src.isAnimated():
+                dst.fromScript(src.toScript())
+        rebuild_table(node)
+    return new
+
+
+def element_values(node, eid):
+    """The element dict for element ``eid`` (values at the current frame)."""
+    k = lambda f: node[elements.knob_name(eid, f)]  # noqa: E731
+    type_name = k("type").value()
+    el = {"type": type_name, "on": bool(k("on").value()), "layer": int(k("layer").getValue()),
+          "intensity": float(k("intensity").value()),
+          "color": tuple(float(k("color").value(i)) for i in range(3)),
+          "size": float(k("size").value()), "axis": float(k("axis").value()),
+          "rotation": float(k("rotation").value()), "seed": int(k("seed").value()),
+          "dispersion": float(k("dispersion").value()),
+          "softness": float(k("softness").value()),
+          "p": [float(k("p%d" % i).value()) for i in range(8)]}
+    if type_name == "Lens System":
+        el.update({"lens": k("lens").value(), "lens_file": k("lens_file").value(),
+                   "fstop": float(k("fstop").value()), "coating": k("coating").value(),
+                   "max_ghosts": int(k("max_ghosts").value()),
+                   "sensor": float(k("sensor").value())})
+    return el
+
+
+def stack(node):
+    return [element_values(node, eid) for eid in element_ids(node)]
+
+
+def apply_type_ui(node, eid):
+    """Labels, ranges and visibility of an element's knobs for its type."""
+    k = lambda f: node.knob(elements.knob_name(eid, f))  # noqa: E731
+    t = elements.TYPES[k("type").value()]
+    position = element_ids(node).index(eid) + 1 if eid in element_ids(node) else 0
+    k("begin").setLabel("%d. %s" % (position, t.name))
+    for field in elements.GENERIC:
+        spec_ = t.generic.get(field)
+        k(field).setVisible(spec_ is not None)
+        if spec_ is not None:
+            k(field).setLabel(spec_[0])
+    for i in range(8):
+        knob = k("p%d" % i)
+        if i < len(t.params):
+            p = t.params[i]
+            knob.setLabel(p.label)
+            knob.setRange(p.lo, p.hi)
+            knob.setTooltip(p.tooltip)
+            knob.setVisible(True)
+        else:
+            knob.setVisible(False)
+    for field in elements.LENS_FIELDS:
+        k(field).setVisible(t.name == "Lens System")
+    k("begin").setTooltip(t.help)
+
+
+def _renumber(node):
+    for eid in element_ids(node):
+        apply_type_ui(node, eid)
+
+
+def rebuild_table(node):
+    """Rewrite the table expressions and element count for the current stack."""
+    columns, problems = [], []
+    for eid in element_ids(node):
+        el = element_values(node, eid)
+        if el["type"] == "Lens System":
+            try:
+                ghosts = lenses.ghosts_for_element(el)
+            except Exception as e:  # bad lens file, etc.
+                problems.append("Element %d (Lens System): %s" % (eid, e))
+                ghosts = []
+            columns += [elements.lens_column_expressions(eid, g, el["fstop"]) for g in ghosts]
+        else:
+            columns.append(elements.column_expressions(eid, el["type"]))
+    columns = columns[:elements.MAX_COLUMNS]
+    crop = node.node("TableCrop")
+    crop["box"].setValue(max(len(columns), 1), 2)
+    for r in range(elements.ROWS):
+        row = node.node("TableRow%d" % r)
+        for c in range(4):
+            row["expr%d" % c].setValue(elements.row_expression(columns, r, c))
+    for child in node.nodes():
+        if child.Class() == "BlinkScript" and param_knob_name(child, "elementCount"):
+            param_knob(child, "elementCount").setValue(len(columns))
+    _renumber(node)
+    if problems and nuke.GUI:
+        nuke.message("\n".join(problems))
+    return len(columns)
+
+
+REBUILD_FIELDS = ("type",) + elements.LENS_FIELDS
+
+
+def element_knob_changed(node, knob):
+    """Called from the node's knobChanged for e<id>_<field> knobs."""
+    name = knob.name()
+    try:
+        eid = int(name[1:name.index("_")])
+    except ValueError:
+        return
+    field = name[name.index("_") + 1:]
+    if eid not in element_ids(node) or field not in REBUILD_FIELDS:
+        return
+    with _NoUndo():
+        if field == "type":
+            # A new type starts from that type's defaults.
+            defaults = elements.knob_values(elements.element(knob.value()))
+            for f, value in defaults.items():
+                target = node.knob(elements.knob_name(eid, f))
+                if target is not None and f not in ("type", "on", "layer"):
+                    if target.isAnimated():
+                        target.clearAnimated()
+                    _set_element_value(target, f, value)
+            apply_type_ui(node, eid)
+        rebuild_table(node)
 
 
 # ------------------------------------------------------------------ toolset

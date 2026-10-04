@@ -123,7 +123,13 @@ if _k is not None and _k.name() in ("inputChange", "showPanel"):
     _blinkflare_links(nuke.thisNode())
     try:
         import blinkflare
-        blinkflare.refresh_presets(nuke.thisNode())
+        blinkflare.refresh_panel(nuke.thisNode())
+    except ImportError:
+        pass
+elif _k is not None and _k.name()[:1] == "e" and _k.name()[1:].split("_")[0].isdigit():
+    try:
+        import blinkflare
+        blinkflare.element_knob_changed(nuke.thisNode(), _k)
     except ImportError:
         pass
 elif _k is not None and _k.name() == "element_layers" and _k.value():

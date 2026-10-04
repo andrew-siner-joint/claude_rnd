@@ -46,6 +46,13 @@ def save_preset(node, name=None):
     return builder.save_preset(node, name)
 
 
+def refresh_panel(node):
+    """Panel opened or inputs changed: refresh the preset menu and the
+    element knobs' labels and visibility."""
+    from blinkflare import builder
+    builder.refresh_panel(node)
+
+
 def refresh_presets(node):
     """Reload the Preset menu from the built-in and saved presets."""
     from blinkflare import builder
@@ -62,6 +69,32 @@ def build_element_layers(node):
     """Build the per-element kernels used by Output > Element Layers."""
     from blinkflare import builder
     builder.build_element_layers(node)
+
+
+def add_element(node, type_name, values=None):
+    """Add an element of ``type_name`` to a BlinkFlare node; returns its id."""
+    from blinkflare import builder
+    return builder.add_element(node, type_name, values)
+
+
+def remove_element(node, eid, later=False):
+    from blinkflare import builder
+    builder.remove_element(node, eid, later=later)
+
+
+def duplicate_element(node, eid):
+    from blinkflare import builder
+    return builder.duplicate_element(node, eid)
+
+
+def clear_elements(node):
+    from blinkflare import builder
+    builder.clear_elements(node)
+
+
+def element_knob_changed(node, knob):
+    from blinkflare import builder
+    builder.element_knob_changed(node, knob)
 
 
 def diagnose():
