@@ -93,9 +93,10 @@ What the lines mean:
   triggers a warning: see [Rig template](03-rig-template.md#2-if-something-is-off-fix-it-in-hugin).
 - **sun**: where the sun is and whether it clipped. See [Blender](06-blender.md#calibrating-the-sun).
 
-A shoot takes a few minutes, mostly decoding raws. The merge runs several
-positions in parallel, as many as your Mac's memory allows (about 3 GB each
-for 33 MP frames).
+A shoot takes a few minutes, mostly decoding raws (a full-size test run,
+8 positions × 3 brackets of 33 MP frames to an 8K HDRI, took 4.5 minutes on a
+4-core machine). The merge runs several positions in parallel, as many as
+your Mac's memory allows (about 3 GB each for 33 MP frames).
 
 ## 4. Check the result
 
@@ -155,7 +156,8 @@ The EV100 of the anchor is stored in each EXR's metadata (`hdristitch:ev100`).
 ## Disk space
 
 Per HDRI, at 8K: about 1 GB of working files (merged positions and proxies)
-and 0.5 GB of results. Set `output.clean_merged = true` to delete the merged
+and 0.8 GB of results (the EXR and its sun-removed copy are ~380 MB each as
+32-bit float; `--half` halves that). Set `output.clean_merged = true` to delete the merged
 positions after each run (then `hdri render` needs a fresh `hdri process`).
 
 ## Batch
