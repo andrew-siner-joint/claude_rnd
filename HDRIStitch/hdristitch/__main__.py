@@ -1,3 +1,5 @@
 from .cli import main
 
-raise SystemExit(main())
+# guarded: merge workers are spawned processes that re-import __main__
+if __name__ == "__main__":
+    raise SystemExit(main())
