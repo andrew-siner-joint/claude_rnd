@@ -1,0 +1,122 @@
+# HDRIStitch settings.
+#
+# `install.sh` copies this file to ~/HDRIStitch/config.toml. Edit that copy;
+# anything you leave out falls back to the value here. Most of these can also
+# be overridden for a single run from the command line (see `hdri process -h`).
+
+[capture]
+# Camera positions per HDRI (6 around + 1 up + 1 down = 8).
+positions = 8
+# Frames per bracket: "auto" detects it from the exposure pattern, or set a
+# number (e.g. 5) if auto-detection guesses wrong.
+brackets = "auto"
+# Seconds of silence that separate one bracket burst from the next, used only
+# when the exposure pattern alone can't split the frames.
+gap_seconds = 2.0
+# File extensions picked up from the shoot folder.
+extensions = [".arw", ".dng"]
+
+[rig]
+# Yaw / pitch (degrees) of each position, in the order you shoot them.
+# Only used to seed the very first alignment; after that the rig template
+# (below) holds the exact geometry.
+layout = [[0, 0], [60, 0], [120, 0], [180, 0], [240, 0], [300, 0], [0, 90], [0, -90]]
+# Rig template name (a Hugin project saved with `hdri template save`).
+# Stored in ~/HDRIStitch/templates/<name>.pto. If it doesn't exist yet, the
+# first shoot is aligned from scratch.
+template = "default"
+
+[lens]
+# "circular" (image circle inside the frame, e.g. 8 mm on full frame) or
+# "fullframe" (diagonal fisheye that fills the frame).
+type = "circular"
+focal_length_mm = 8.0
+sensor_width_mm = 35.9          # Sony a7 IV
+# Horizontal field of view of the whole frame in degrees; 0 = estimate it
+# from the focal length (equidistant fisheye). The optimiser refines it.
+hfov = 0.0
+# Image-circle crop: "auto" detects it from the photos, or give
+# [left, right, top, bottom] in pixels.
+crop = "auto"
+# Shrink the detected circle by this fraction of its radius, to keep the soft,
+# fringed edge of the image circle out of the stitch.
+crop_margin = 0.03
+
+[color]
+# White balance used to develop the raws:
+#   "auto"      Lightroom/Camera Raw XMP sidecars if present, else as shot
+#   "asshot"    the camera's as-shot WB of the reference frame
+#   "xmp"       read Temperature/Tint from XMP sidecars (required)
+#   "5600"      a colour temperature in kelvin
+#   "5600,+10"  temperature and tint (Lightroom scale)
+#   "d65"       the camera matrix's D65 white
+white_balance = "auto"
+# Output colour space (scene linear): "rec709" (Blender's default Linear
+# Rec.709), "acescg", or "rec2020".
+gamut = "rec709"
+# Exposure normalisation:
+#   "reference"  values match the middle bracket (sensor clip at that
+#                exposure = 1.0); good default for a single HDRI
+#   a number     an absolute EV100 anchor, e.g. 12.0, so several HDRIs from
+#                one location stay consistent with each other
+exposure = "reference"
+
+[merge]
+# LibRaw demosaic: "AHD", "DHT", "AAHD", "VNG", "PPG", "DCB" or "LINEAR".
+demosaic = "AHD"
+# Pixels above clip_start (fraction of sensor clip) fade out of the merge,
+# reaching zero weight at clip_end.
+clip_start = 0.80
+clip_end = 0.95
+# Measure the true exposure ratio between brackets from the image data
+# (shutter speeds are never exact). Off = trust EXIF.
+refine_exposure = true
+# Parallel positions while merging. 0 = pick from CPU count and memory.
+jobs = 0
+
+[stitch]
+# With a rig template: find new control points and fine-tune positions.
+refine = true
+# A position with few control points (under 8, e.g. a featureless sky) may
+# move at most this far from the template; otherwise its template pose is
+# kept. Well-supported positions may move freely (handheld nadir shots).
+max_refine_deg = 2.0
+# Remove control points on clouds (Hugin's celeste); slower.
+celeste = false
+# Level the horizon from vertical lines in the scene (buildings, poles)
+# instead of the rotator's axis. Use it when the tripod wasn't level and the
+# scene has true verticals; leave it off in nature (trees aren't vertical).
+vertical_lines = false
+# Seam blending: higher = narrower blend between neighbouring shots
+# (less ghosting of moving clouds/people), lower = smoother transitions.
+blend_sharpness = 8.0
+# Feather at mask edges, as a fraction of the output width.
+feather = 0.006
+# "safe-cubic" (sharp, no ringing around the sun), "cubic" or "linear".
+interpolation = "safe-cubic"
+
+[output]
+# Equirectangular width in pixels (height = width / 2). 8192 suits an 8 mm
+# fisheye on the a7 IV; "auto" uses the lens's native resolution.
+width = 8192
+# Store the full-size EXR as 16-bit half instead of 32-bit float. Half is
+# half the size but tops out at 65504, which a captured sun can exceed.
+half_float = false
+# Extra lightweight copy for fast look-dev; 0 = skip.
+preview_width = 2048
+# Fill any area no photo covered (usually under the tripod) with a smooth
+# blur of its surroundings, so the HDRI has no black hole. A mask of the
+# filled area is written next to the EXR for clean-up in Nuke.
+fill_holes = true
+# Detect the sun after stitching and write <name>_sun.json for Blender.
+sun = true
+# Delete the merged per-position EXRs after a successful run (keeps the
+# Hugin project and proxies). Turn on to save disk space; `hdri render` then
+# needs a fresh merge.
+clean_merged = false
+
+[tools]
+# Folder holding Hugin's command-line tools (nona, cpfind, ...). Empty =
+# search PATH and the Hugin app bundle in /Applications.
+hugin_bin = ""
+exiftool = ""

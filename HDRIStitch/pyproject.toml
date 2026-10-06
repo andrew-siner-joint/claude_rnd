@@ -1,0 +1,30 @@
+[build-system]
+requires = ["setuptools>=64"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "hdristitch"
+version = "1.0.0"
+description = "Bracketed fisheye raws (Sony ARW) to stitched, scene-linear HDRI EXRs"
+requires-python = ">=3.10"
+dependencies = [
+    "numpy>=1.24",
+    "rawpy>=0.19",
+    "opencv-python-headless>=4.8",
+    "OpenEXR>=3.3",
+    "tifffile>=2023.1",
+    "tomli>=2.0; python_version < '3.11'",
+]
+
+[project.scripts]
+hdri = "hdristitch.cli:main"
+
+[tool.setuptools]
+packages = ["hdristitch"]
+
+[tool.setuptools.package-data]
+hdristitch = ["default_config.toml"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+markers = ["slow: end-to-end runs that need Hugin's command-line tools"]
