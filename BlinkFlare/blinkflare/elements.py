@@ -32,10 +32,10 @@ PASSES = [
     (4, "Ghosts", "flare_ghosts"),
     (5, "Rings", "flare_rings"),
     (6, "Other", "flare_other"),
-    (7, "Dirt", "flare_dirt"),
 ]
 PASS_CODES = dict((name, code) for code, name, _ in PASSES)
-LAYER_ITEMS = ["Auto"] + [name for _, name, _ in PASSES[:-1]]
+# An element's Layer menu: Auto (its type's pass), then each pass by code.
+LAYER_ITEMS = ["Auto"] + [name for _, name, _ in PASSES]
 
 GENERIC = ("intensity", "color", "size", "axis", "rotation", "seed", "dispersion", "softness")
 

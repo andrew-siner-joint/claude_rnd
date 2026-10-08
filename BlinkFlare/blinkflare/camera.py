@@ -22,9 +22,9 @@ PROJECTION_NODE = "Projection"
 CAMERA_XFORM = "CameraXform"
 LIGHT_XFORM = "LightXform"
 
-CAMERA_INPUT = 3
-AXIS_INPUT = 4
-MASK_INPUT = 5
+CAMERA_INPUT = 2
+AXIS_INPUT = 3
+MASK_INPUT = 4
 
 # (Projection knob, camera knob, channel, value when no camera is connected)
 LENS_KNOBS = [

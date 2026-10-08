@@ -89,6 +89,13 @@ class InstallerTest(unittest.TestCase):
         self.assertIn("ok    BlinkFlare kernel: compiled at once", report)
         self.assertIn("Built BlinkFlare1", report)
         self.assertRegex(report, r"ok    element table: \d+ columns \(\d+ values\) match")
+        self.assertIn("inputs: 0 src, 1 occlusion, 2 cam, 3 axis, 4 mask (the node shows 5)", report)
+        self.assertIn("ok    panel: tabs in order", report)
+        group = fake_nuke.root().node("BlinkFlare1")
+        self.assertEqual(group["output_mode"].value(), "Composite")  # probe values put back
+        from blinkflare import builder, presets
+        self.assertEqual(len(builder.element_ids(group)),
+                         len(presets.stack(presets.PRESETS["Default"])))  # probe element removed
         self.assertNotIn("More test kernels", report)  # only run when something fails
         self.assertEqual(set(fake_nuke.compile_gpu), {False})  # test compiles are CPU-only
         self.assertNotIn("PROBLEM", report)
@@ -106,6 +113,34 @@ class InstallerTest(unittest.TestCase):
         self.assertRegex(report, r"column \d+ row \d+ (red|alpha): Nuke")
         self.assertNotIn("TableProbe", [n.name() for n in fake_nuke.root().node("BlinkFlare1").children()])
         self.assertIn("found problems", fake_nuke.messages[-1])
+
+    def test_panel_problems_are_reported(self):
+        self.run_main()
+        group = fake_nuke.root().node("BlinkFlare1")
+        builder = sys.modules["blinkflare.builder"]  # the copy the installer imported
+        fake_nuke.REMOVE_KNOB_RESETS[0] = True
+
+        def exit_without_restoring(lift, *exc):  # as if values and links couldn't be restored
+            for knob in lift.knobs:
+                lift.node.addKnob(knob)
+            return False
+        rep = self.inst.Report(os.path.join(self.tmp.name, "panel.txt"))
+        with mock.patch.object(builder._AfterElementsLifted, "__exit__", exit_without_restoring):
+            self.inst.check_panel(rep, group)
+        text = rep.text()
+        self.assertIn("Adding an element upset the panel: output_mode changed", text)
+        self.assertIn("operation lost its link", text)
+        self.assertEqual(group["output_mode"].value(), "Composite")  # put back afterwards
+
+    def test_misnumbered_inputs_are_reported(self):
+        self.run_main()
+        group = fake_nuke.root().node("BlinkFlare1")
+        group.node("axis")["number"].setValue(4)
+        group.node("mask")["number"].setValue(3)
+        rep = self.inst.Report(os.path.join(self.tmp.name, "inputs.txt"))
+        self.inst.check_inputs(rep, group)
+        self.assertIn("inputs: 0 src, 1 occlusion, 2 cam, 3 mask, 4 axis", rep.text())
+        self.assertRegex(rep.problems[0], r"inputs aren't numbered as expected \((axis, mask|mask, axis)\)")
 
     def test_diagnose_entry_point_runs_installer(self):
         sys.path.insert(0, ROOT)

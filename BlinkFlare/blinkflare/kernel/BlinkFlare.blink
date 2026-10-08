@@ -25,18 +25,16 @@
 //   src        - the plate; defines the output bounds and is sampled at the
 //                light when brightness/colour follow the source.
 //   occlusion  - alpha (or depth, copied into red) sampled around the light.
-//   dirt       - lens dirt texture lit by the flare.
 //   elements   - the element table.
 // The output is the flare alone; the group composites it.
 //
 // soloPass renders one render pass (1 glow, 2 rays, 3 streaks, 4 ghosts,
-// 5 rings, 6 other, 7 dirt; 0 = everything).
+// 5 rings, 6 other; 0 = everything).
 
 kernel BlinkFlareKernel : ImageComputationKernel<ePixelWise>
 {
   Image<eRead, eAccessRandom, eEdgeClamped> src;
   Image<eRead, eAccessRandom, eEdgeConstant> occlusion;
-  Image<eRead, eAccessPoint, eEdgeConstant> dirt;
   Image<eRead, eAccessRandom, eEdgeConstant> elements;
   Image<eWrite> dst;
 
@@ -85,13 +83,6 @@ kernel BlinkFlareKernel : ImageComputationKernel<ePixelWise>
     float  sourceRadius;
     float  sourceBlack;
     float  sourceWhite;
-
-    // Lens dirt
-    bool   dirtEnable;
-    float  dirtIntensity;
-    float  dirtSpread;
-    float  dirtResponse;
-    float4 dirtColor;
 
   local:
     float  _invH;
@@ -151,12 +142,6 @@ kernel BlinkFlareKernel : ImageComputationKernel<ePixelWise>
     defineParam(sourceRadius, "sourceRadius", 10.0f);
     defineParam(sourceBlack, "sourceBlack", 0.0f);
     defineParam(sourceWhite, "sourceWhite", 1.0f);
-
-    defineParam(dirtEnable, "dirtEnable", false);
-    defineParam(dirtIntensity, "dirtIntensity", 1.0f);
-    defineParam(dirtSpread, "dirtSpread", 0.45f);
-    defineParam(dirtResponse, "dirtResponse", 1.0f);
-    defineParam(dirtColor, "dirtColor", float4(1.0f, 0.85f, 0.7f, 1.0f));
   }
 
   // ------------------------------------------------------------------ helpers
@@ -733,13 +718,6 @@ kernel BlinkFlareKernel : ImageComputationKernel<ePixelWise>
     return length(d) <= size * _S * slack + _invH * 4.0f;
   }
 
-  float3 dirtTerm(float rA, float3 flare, float4 dv)
-  {
-    float x = rA / max(dirtSpread * _S, 0.00001f);
-    float3 light = lfRGB(dirtColor) * exp(-x * x) + flare * dirtResponse;
-    return float3(dv.x, dv.y, dv.z) * light * dirtIntensity;
-  }
-
   // -------------------------------------------------------------------- setup
 
   void init()
@@ -838,10 +816,7 @@ kernel BlinkFlareKernel : ImageComputationKernel<ePixelWise>
       float r = length(d);
       float ang = atan2(d.y, d.x);
 
-      bool showAll = soloPass < 1 || soloPass > 7;
-      bool dirtSolo = soloPass == 7;
-      // Dirt reacts to the other elements, so soloing it still evaluates them.
-      bool forDirt = dirtSolo && dirtEnable && dirtResponse > 0.0f;
+      bool showAll = soloPass < 1 || soloPass > 6;
 
       int n = lfClampi(elementCount, 0, 96);
       for (int i = 0; i < n; i++) {
@@ -852,7 +827,7 @@ kernel BlinkFlareKernel : ImageComputationKernel<ePixelWise>
         }
         float4 r1 = elements(i, 1);
         int pass = int(r1.w + 0.5f);
-        if (!(showAll || forDirt || pass == soloPass)) {
+        if (!(showAll || pass == soloPass)) {
           continue;
         }
         float4 r2 = elements(i, 2);
@@ -895,17 +870,6 @@ kernel BlinkFlareKernel : ImageComputationKernel<ePixelWise>
           e = lensGhost(P, r0, color, r2, r3, elements(i, 5));
         }
         col += e * r0.y;
-      }
-
-      if (dirtEnable && (showAll || dirtSolo)) {
-        float4 dv = dirt();
-        float rA = length(lfSqueeze(d));
-        float3 dc = dirtTerm(rA, col, dv);
-        if (dirtSolo) {
-          col = dc;
-        } else {
-          col += dc;
-        }
       }
       col = col * lfRGB(masterTint) * srcTint * (masterIntensity * vis);
     }

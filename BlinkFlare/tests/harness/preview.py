@@ -44,30 +44,6 @@ def plate(w, h):
     return rgba.astype(np.float32)
 
 
-def dirt_texture(w, h, seed=3):
-    """Procedural lens dirt: soft blobs, rings and a couple of smears."""
-    rng = np.random.default_rng(seed)
-    yy, xx = np.mgrid[0:h, 0:w].astype(np.float32)
-    acc = np.zeros((h, w), np.float32)
-    for _ in range(140):
-        cx, cy = rng.uniform(0, w), rng.uniform(0, h)
-        r = rng.uniform(0.004, 0.035) * h
-        d2 = ((xx - cx) ** 2 + (yy - cy) ** 2) / (r * r)
-        blob = np.exp(-d2 * 2.0)
-        if rng.uniform() < 0.3:
-            blob = blob * np.clip(d2 * 1.5, 0.0, 1.0)  # dried droplet ring
-        acc += blob * rng.uniform(0.15, 0.6)
-    for _ in range(4):
-        cx, cy = rng.uniform(0, w), rng.uniform(0, h)
-        ang = rng.uniform(0, np.pi)
-        u = (xx - cx) * np.cos(ang) + (yy - cy) * np.sin(ang)
-        v = -(xx - cx) * np.sin(ang) + (yy - cy) * np.cos(ang)
-        acc += 0.25 * np.exp(-(u / (0.25 * h)) ** 2 - (v / (0.02 * h)) ** 2)
-    acc = np.clip(acc, 0.0, 1.0)
-    rgba = np.stack([acc, acc, acc, acc], axis=-1)
-    return rgba.astype(np.float32)
-
-
 def look(preset="Default", overrides=None, w=960, h=540, stack=None):
     """(values, stack) for a preset with optional knob overrides."""
     available = presets.all_presets()
@@ -92,7 +68,7 @@ def table_image(stack, ghosts_for=None):
     return img, len(columns)
 
 
-def render_flare(values, w, h, stack=(), src=None, occlusion=None, dirt=None, scene=None,
+def render_flare(values, w, h, stack=(), src=None, occlusion=None, scene=None,
                  verbose=False, ghosts_for=None, element_count=None):
     """Return the kernel output (flare only) as float32 HxWx4, row 0 bottom."""
     params = spec.resolve_params(values, w, h, scene)
@@ -108,7 +84,7 @@ def render_flare(values, w, h, stack=(), src=None, occlusion=None, dirt=None, sc
         tpath = os.path.join(tmp, "table.raw")
         table.tofile(tpath)
         cmd = [BINARY, str(w), str(h), pfile, out, "--elements", tpath, str(table.shape[1])]
-        for flag, img in (("--src", src), ("--occlusion", occlusion), ("--dirt", dirt)):
+        for flag, img in (("--src", src), ("--occlusion", occlusion)):
             if img is not None:
                 path = os.path.join(tmp, flag.strip("-") + ".raw")
                 np.ascontiguousarray(img, np.float32).tofile(path)

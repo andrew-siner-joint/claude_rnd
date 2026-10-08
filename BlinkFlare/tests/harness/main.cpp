@@ -1,7 +1,7 @@
 // Harness driver: renders BlinkFlare.blink on the CPU.
 //
 //   blinkflare_render --list-params
-//   blinkflare_render W H params.txt out.raw [--src f] [--occlusion f] [--dirt f]
+//   blinkflare_render W H params.txt out.raw [--src f] [--occlusion f]
 //                     [--elements f N]   (element table: N columns x 6 rows)
 //
 // params.txt: one "name v0 [v1 ...]" per line. Images are raw float32 RGBA,
@@ -28,20 +28,20 @@ int main(int argc, char** argv) {
   if (argc >= 2 && std::strcmp(argv[1], "--list-params") == 0) {
     std::vector<float> dummy(4, 0.0f);
     BfImage im{dummy.data(), 1, 1};
-    bf_create(im, im, im, im, im);
+    bf_create(im, im, im, im);
     for (int i = 0; i < bf_param_count(); i++) {
       std::printf("%s %d\n", bf_param_name(i), bf_param_components(i));
     }
     return 0;
   }
   if (argc < 5) {
-    std::fprintf(stderr, "usage: %s W H params.txt out.raw [--src f] [--occlusion f] [--dirt f]\n", argv[0]);
+    std::fprintf(stderr, "usage: %s W H params.txt out.raw [--src f] [--occlusion f]\n", argv[0]);
     return 2;
   }
   int w = std::atoi(argv[1]);
   int h = std::atoi(argv[2]);
   size_t n = static_cast<size_t>(w) * static_cast<size_t>(h) * 4;
-  std::vector<float> src(n, 0.0f), occlusion(n, 0.0f), dirt(n, 0.0f), out(n, 0.0f);
+  std::vector<float> src(n, 0.0f), occlusion(n, 0.0f), out(n, 0.0f);
   std::vector<float> table(4, 0.0f);
   int columns = 1;
 
@@ -58,8 +58,7 @@ int main(int argc, char** argv) {
       continue;
     }
     std::vector<float>* target = flag == "--src" ? &src
-                               : flag == "--occlusion" ? &occlusion
-                               : flag == "--dirt" ? &dirt : nullptr;
+                               : flag == "--occlusion" ? &occlusion : nullptr;
     if (!target || !loadRaw(argv[i + 1], *target)) {
       std::fprintf(stderr, "bad input %s %s\n", argv[i], argv[i + 1]);
       return 2;
@@ -67,8 +66,7 @@ int main(int argc, char** argv) {
   }
 
   bf_create(BfImage{src.data(), w, h}, BfImage{occlusion.data(), w, h},
-            BfImage{dirt.data(), w, h}, BfImage{table.data(), columns, 6},
-            BfImage{out.data(), w, h});
+            BfImage{table.data(), columns, 6}, BfImage{out.data(), w, h});
 
   std::ifstream pf(argv[3]);
   std::string line;

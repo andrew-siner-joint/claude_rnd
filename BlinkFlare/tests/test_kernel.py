@@ -145,42 +145,26 @@ class Passes(unittest.TestCase):
     def setUpClass(cls):
         preview.build()
 
-    def dirt(self):
-        dirt = np.zeros((H, W, 4), np.float32)
-        dirt[::7, ::5] = 1.0
-        return dirt
-
     def test_solo_passes_sum_to_full_flare(self):
-        full = render(ALL_TYPES, {"dirt_enable": True}, dirt=self.dirt())
-        parts = sum(render(ALL_TYPES, {"dirt_enable": True, "solo": code}, dirt=self.dirt())[..., :3]
-                    for code, _, _ in elements.PASSES)
+        full = render(ALL_TYPES)
+        parts = sum(render(ALL_TYPES, {"solo": code})[..., :3] for code, _, _ in elements.PASSES)
         np.testing.assert_allclose(parts, full[..., :3], rtol=1e-4, atol=1e-5)
 
     def test_each_solo_pass_is_its_elements(self):
-        for code, name, _ in elements.PASSES[:-1]:
+        for code, name, _ in elements.PASSES:
             members = [el for el in ALL_TYPES if elements.resolve_pass(el["type"], 0) == code]
             np.testing.assert_allclose(render(ALL_TYPES, {"solo": code}), render(members),
                                        rtol=1e-6, atol=1e-7, err_msg=name)
+
+    def test_out_of_range_solo_shows_everything(self):
+        np.testing.assert_array_equal(render(ALL_TYPES, {"solo": len(elements.PASSES) + 1}),
+                                      render(ALL_TYPES))
 
     def test_layer_override_moves_an_element(self):
         glow = elements.element("Glow", layer=elements.PASS_CODES["Other"])
         self.assertEqual(render([glow], {"solo": elements.PASS_CODES["Glow"]}).max(), 0.0)
         np.testing.assert_array_equal(render([glow], {"solo": elements.PASS_CODES["Other"]}),
                                       render([glow]))
-
-    def test_solo_dirt_sees_other_elements(self):
-        dirt = np.ones((H, W, 4), np.float32)
-        solo = elements.PASS_CODES["Dirt"]
-        lit = render(DEFAULT_STACK, {"dirt_enable": True, "solo": solo, "dirt_response": 1.0}, dirt=dirt)
-        unlit = render(DEFAULT_STACK, {"dirt_enable": True, "solo": solo, "dirt_response": 0.0}, dirt=dirt)
-        self.assertGreater(lit[..., :3].sum(), unlit[..., :3].sum() * 1.05)
-
-    def test_dirt_only_where_texture(self):
-        dirt = np.zeros((H, W, 4), np.float32)
-        dirt[:, : W // 2] = 1.0
-        on = render([], {"dirt_enable": True}, dirt=dirt)
-        self.assertGreater(on[:, : W // 2].max(), 0.0)
-        self.assertEqual(on[:, W // 2:].max(), 0.0)
 
 
 class Geometry(unittest.TestCase):

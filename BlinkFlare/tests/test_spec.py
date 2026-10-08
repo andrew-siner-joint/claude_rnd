@@ -67,10 +67,14 @@ class KnobSpec(unittest.TestCase):
             # Element knobs are e<id>_<field>; static names must never look like that.
             self.assertIsNone(re.match(r"e\d+_", n), n)
 
-    def test_tabs_and_elements_last(self):
+    def test_tab_order(self):
         tabs = [k for k in spec.KNOBS if k.kind == "tab"]
         self.assertIs(spec.KNOBS[0], tabs[0])
-        self.assertEqual(tabs[-1].name, "tab_elements")
+        self.assertEqual([t.label for t in tabs], ["Flare", "Lens", "Elements", "3D", "Output"])
+        # Element knobs are inserted before everything from the 3D tab on.
+        names = [k.name for k in spec.KNOBS]
+        self.assertEqual(spec.AFTER_ELEMENTS, names[names.index("tab_3d"):])
+        self.assertEqual(names[names.index("tab_3d") - 1], spec.ELEMENTS_TAB_END)
 
     def test_value_knobs_have_defaults(self):
         for k in spec.value_knobs():

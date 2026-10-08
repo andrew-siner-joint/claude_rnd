@@ -125,7 +125,7 @@ class Knob(object):
         self.label = text
 
     def toScript(self):
-        return json.dumps({"values": self.values, "keys": dict((str(c), dict((str(f), v) for f, v in k.items()))
+        return json.dumps({"values": self.values, "keys": dict((str(c), dict((repr(float(f)), v) for f, v in k.items()))
                                                              for c, k in self.keys.items()),
                            "expressions": dict((str(c), e) for c, e in self.expressions.items())})
 
@@ -256,8 +256,13 @@ class File_Knob(String_Knob):
 
 
 class Link_Knob(Knob):
+    link = ""
+
     def setLink(self, target):
         self.link = target
+
+    def getLink(self):
+        return self.link
 
 
 # ---------------------------------------------------------------------- nodes
@@ -327,6 +332,8 @@ messages = []
 # Which output channel each Expression node exprN writes (Nuke's defaults:
 # expr0 red ... expr3 alpha); tests change it to simulate other setups.
 EXPRESSION_CHANNELS = [0, 1, 2, 3]
+# When true, removeKnob wipes the knob's values, animation and link.
+REMOVE_KNOB_RESETS = [False]
 RGBA_NAMES = ("red", "green", "blue", "alpha")
 
 
@@ -360,6 +367,8 @@ class Node(object):
         if cls == "BlinkScript":
             self["useGPUIfAvailable"].setValue(True)  # Nuke's default
         if parent is not None:
+            if cls == "Input":  # Nuke numbers a group's inputs in creation order
+                self["number"].setValue(len([c for c in parent._children if c._class == "Input"]))
             parent._children.append(self)
             self.setName(cls + "1")
 
@@ -375,6 +384,11 @@ class Node(object):
         if name not in self._knobs:
             raise NameError("%s has no knob %r" % (self._name, name))
         return self._knobs[name]
+
+    def allKnobs(self):
+        """Knobs in panel order (built-in ones first, then user knobs)."""
+        user = [self._knobs[n] for n in self.user_knob_order]
+        return [k for k in self._knobs.values() if k not in user] + user
 
     def knobs(self):
         if getattr(self, "_pending", 0):
@@ -431,6 +445,10 @@ class Node(object):
             raise ValueError("knob %r is not on %s" % (name, self._name))
         del self._knobs[name]
         self.user_knob_order.remove(name)
+        if REMOVE_KNOB_RESETS[0]:  # simulate a Nuke that drops a removed knob's state
+            knob.values = [knob.default] * knob.channels
+            knob.keys, knob.expressions, knob.animated = {}, {}, False
+            knob.link = None
 
     @property
     def user_knob_order(self):
@@ -604,6 +622,7 @@ def reset(fmt=None):
     del inputs_queue[:]
     del messages[:]
     EXPRESSION_CHANNELS[:] = [0, 1, 2, 3]
+    REMOVE_KNOB_RESETS[0] = False
     Undo._disabled[0] = False
     _layers[:] = ["rgba", "depth"]
     root()._format = fmt or Format(1920, 1080)

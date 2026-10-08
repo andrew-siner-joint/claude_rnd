@@ -3,8 +3,7 @@
 Node graph inside the group:
 
     src ── SrcChannels ── Canvas (Crop to format) ─────────────────┐
-    occlusion ── OcclusionChannels ── OcclusionDepth (depth→red) ──┤
-    dirt ── DirtChannels ── DirtFit (Reformat fill) ───────────────┼── FlareKernel ── [element layers] ── MotionBlur ──┐
+    occlusion ── OcclusionChannels ── OcclusionDepth (depth→red) ──┼── FlareKernel ── [element layers] ── MotionBlur ──┐
     TableBase ── TableCrop ── TableRow0..5 (Expressions) ──────────┘                                                  │
     cam ── CameraXform (Axis) ┐                                                                                       │
     axis ── LightXform (Axis) ┴── Projection (NoOp, expressions only)                                                  │
@@ -13,13 +12,15 @@ Node graph inside the group:
 
 The kernel renders the flare alone; the Merge composites it so the operation,
 mix and mask behave like any Nuke merge and the source alpha passes through.
-Element Layers adds one solo kernel per element plus Copy nodes, built the
-first time it is switched on.
+Element Layers adds one solo kernel per render pass plus Copy nodes, built
+the first time it is switched on.
 
 The flare's elements are knobs added at runtime (e<id>_<field>, one
 collapsible group each). The TableRow Expression nodes turn them into the
 small table image the kernel reads (see elements.py); adding, removing or
-re-typing an element rewrites those expressions.
+re-typing an element rewrites those expressions. Nuke only appends knobs, so
+adding an element lifts the 3D and Output tabs off and puts them back after
+it (_AfterElementsLifted).
 
 Kernels are never compiled while a node is being built: the first create()
 compiles once in the background (see compiling.py) and caches the compiled
@@ -276,11 +277,13 @@ def add_group_knobs(group, fmt):
         group.addKnob(knob)
         if k.is_value:
             set_knob_value(knob, k, values[k.name])
-    for name, value in (("element_ids", ""), ("blinkflare_version", spec.VERSION)):
-        knob = nuke.String_Knob(name, name)
-        group.addKnob(knob)
-        knob.setValue(value)
-        knob.setVisible(False)
+        if k.name == spec.ELEMENTS_TAB_END:
+            # Bookkeeping, hidden at the end of the Elements tab's own knobs.
+            for name, value in (("element_ids", ""), ("blinkflare_version", spec.VERSION)):
+                hidden = nuke.String_Knob(name, name)
+                group.addKnob(hidden)
+                hidden.setValue(value)
+                hidden.setVisible(False)
     group["knobChanged"].setValue(knob_changed)
 
 
@@ -361,7 +364,7 @@ def build_table_nodes():
 def build_internals(group, template):
     """Create the node graph inside ``group``. Returns the main kernel."""
     with group:
-        names = ["src", "occlusion", "dirt", "cam", "axis", "mask"]
+        names = ["src", "occlusion", "cam", "axis", "mask"]
         ins = {}
         for i, name in enumerate(names):
             ins[name] = nuke.nodes.Input(name=name)
@@ -391,22 +394,10 @@ def build_internals(group, template):
         occ["to0"].setValue("rgba.red")
         occ.setXYpos(220, 160)
 
-        dirt_ch = nuke.nodes.AddChannels(name="DirtChannels", inputs=[ins["dirt"]])
-        dirt_ch["channels"].setValue("rgba")
-        dirt_ch.setXYpos(440, 80)
-        dirt = nuke.nodes.Reformat(name="DirtFit", inputs=[dirt_ch])
-        dirt["type"].setValue("to box")
-        dirt["box_fixed"].setValue(True)
-        dirt["box_width"].setExpression("Canvas.width")
-        dirt["box_height"].setExpression("Canvas.height")
-        dirt["resize"].setValue("fill")
-        dirt["center"].setValue(True)
-        dirt.setXYpos(440, 160)
-
         build_projection(canvas, ins["cam"], ins["axis"])
         table = build_table_nodes()
 
-        blink = make_kernel(spec.KERNEL_NODE, [canvas, occ, dirt, table], template)
+        blink = make_kernel(spec.KERNEL_NODE, [canvas, occ, table], template)
         if blink.knob("useGPUIfAvailable") is not None:
             blink["useGPUIfAvailable"].setValue(True)
         blink.setXYpos(220, 260)
@@ -529,7 +520,7 @@ def build_element_layers(group):
     with group:
         mb = group.node(spec.MOTION_BLUR_NODE)
         switch = group.node(spec.SWITCH_NODE)
-        inputs = [main.input(i) for i in range(4)]
+        inputs = [main.input(i) for i in range(main.maxInputs())]
         prev_stream = main
         prev_comp = group.node(spec.MERGE_NODE)
         off = "1 - parent.element_layers"
@@ -638,8 +629,9 @@ def apply_preset(node, name=None):
                 knob.clearAnimated()
             set_knob_value(knob, k, values[k.name])
         clear_elements(node, rebuild=False)
-        for el in presets.stack(preset):
-            add_element(node, el["type"], el, rebuild=False)
+        with _AfterElementsLifted(node):
+            for el in presets.stack(preset):
+                add_element(node, el["type"], el, rebuild=False)
         rebuild_table(node)
 
 
@@ -791,6 +783,55 @@ def _set_element_value(knob, field, value):
         knob.setValue(float(value))
 
 
+class _AfterElementsLifted(object):
+    """Nuke can only append knobs, so new element knobs would land on the
+    last tab. While this is active, the knobs of the tabs after Elements (3D,
+    Output) are off the node; on exit they go back on, after the new element
+    knobs. Their values, animation and links are snapshotted and restored, in
+    case removing a knob loses them. Re-entrant: an inner use finds nothing
+    left to lift."""
+
+    def __init__(self, node):
+        self.node = node
+        self.knobs, self.values, self.links = [], [], []
+
+    def __enter__(self):
+        node = self.node
+        self.knobs = [node.knob(n) for n in spec.AFTER_ELEMENTS if node.knob(n) is not None]
+        for knob in self.knobs:
+            k = spec.knob(knob.name())
+            if k.is_value:
+                self.values.append((knob, knob.toScript()))
+            elif k.kind == "link":
+                self.links.append((knob, _link_target(knob)))
+        lifted = []
+        try:
+            for knob in reversed(self.knobs):
+                node.removeKnob(knob)
+                lifted.insert(0, knob)
+        except Exception:
+            self.knobs = lifted  # put back what did come off
+            self.__exit__()
+            raise
+        return self
+
+    def __exit__(self, *exc):
+        for knob in self.knobs:
+            self.node.addKnob(knob)
+        for knob, script in self.values:
+            if knob.toScript() != script:
+                knob.fromScript(script)
+        for knob, target in self.links:
+            if target and _link_target(knob) != target:
+                knob.setLink(target)
+        return False
+
+
+def _link_target(knob):
+    get = getattr(knob, "getLink", None)
+    return get() if get is not None else None
+
+
 def add_element(node, type_name, values=None, rebuild=True):
     """Add an element of ``type_name`` (with optional element dict values)."""
     _require_v3(node)
@@ -799,7 +840,7 @@ def add_element(node, type_name, values=None, rebuild=True):
     ids = element_ids(node)
     eid = _next_id(node)
     knob_values = elements.knob_values(elements.element(type_name, **_overrides(el)))
-    with _NoUndo():
+    with _NoUndo(), _AfterElementsLifted(node):
         for field, knob in _element_knobs(eid):
             if field in GENERIC_RANGES:
                 knob.setRange(*GENERIC_RANGES[field])

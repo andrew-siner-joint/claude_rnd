@@ -17,7 +17,7 @@ MERGE_NODE = "Composite"
 SWITCH_NODE = "OutputSwitch"
 MOTION_BLUR_NODE = "MotionBlur"
 
-VERSION = "3.0.0"
+VERSION = "3.1.0"
 
 # Render passes (kernel soloPass) and the layers Element Layers writes.
 PASSES = elements.PASSES
@@ -225,15 +225,18 @@ KNOBS = [
                   "element's Coating Mix). Typical coatings reflect magenta, green and amber."),
     color("coating_b", "Coating B", (0.45, 1.0, 0.55), "coatingB"),
     color("coating_c", "Coating C", (1.0, 0.7, 0.3), "coatingC"),
-    divider("div_dirt", "Lens Dirt"),
-    text("dirt_info", "Connect a lens dirt / smudge texture to the 'dirt' input."),
-    boolean("dirt_enable", "Enable Dirt", False, "dirtEnable"),
-    dbl("dirt_intensity", "Intensity", 1.0, 0.0, 4.0, "dirtIntensity"),
-    dbl("dirt_spread", "Spread", 0.45, 0.0, 2.0, "dirtSpread",
-        tooltip="Radius around the light where the dirt is lit, in frame heights."),
-    dbl("dirt_response", "Flare Response", 1.0, 0.0, 4.0, "dirtResponse",
-        tooltip="How much the flare elements themselves light up the dirt."),
-    color("dirt_color", "Color", (1.0, 0.85, 0.7), "dirtColor"),
+
+    # --------------------------------------------------------------- Elements
+    # Elements are added at runtime. Nuke can only append knobs, so the
+    # builder lifts the knobs after this tab (AFTER_ELEMENTS) off and puts
+    # them back around every addition.
+    tab("tab_elements", "Elements"),
+    Knob("add_type", "enum", "New Element", 0, items=elements.TYPE_NAMES,
+         tooltip="Pick a type, then Add. Elements are additive, so their order doesn't "
+                 "change the image."),
+    Knob("add_element", "button", "Add", script=ADD_SCRIPT, newline=False),
+    Knob("clear_elements", "button", "Remove All", script=CLEAR_SCRIPT, newline=False),
+    text("elements_info", "Each element below opens to show its controls."),
 
     # --------------------------------------------------------------------- 3D
     tab("tab_3d", "3D"),
@@ -269,9 +272,9 @@ KNOBS = [
                  "picks its pass). Affects the render, so set it back to All."),
     boolean("element_layers", "Element Layers", False,
             tooltip="Also write each render pass to its own layer (flare_glow, "
-                    "flare_rays, flare_streaks, flare_ghosts, flare_rings, flare_other, "
-                    "flare_dirt) for grading downstream. Renders the flare once per pass, "
-                    "so it is slower."),
+                    "flare_rays, flare_streaks, flare_ghosts, flare_rings, flare_other) "
+                    "for grading downstream. Renders the flare once per pass, so it is "
+                    "slower."),
     Knob("render_region", "enum", "Render Region", 0, items=["Format", "Input BBox"],
          tooltip="Format renders the flare inside the frame. Input BBox renders it over "
                  "the whole input bounding box, for overscan comps."),
@@ -292,17 +295,12 @@ KNOBS = [
     Knob("vectorize", "link", "Vectorize on CPU", link=KERNEL_NODE + ".vectorize",
          alts=("vectorise",), newline=False, tooltip="Use SIMD on the CPU fallback path."),
 
-    # --------------------------------------------------------------- Elements
-    # Kept last: elements are added at runtime and Nuke appends new knobs to
-    # the end of the panel.
-    tab("tab_elements", "Elements"),
-    Knob("add_type", "enum", "New Element", 0, items=elements.TYPE_NAMES,
-         tooltip="Pick a type, then Add. Elements are additive, so their order doesn't "
-                 "change the image."),
-    Knob("add_element", "button", "Add", script=ADD_SCRIPT, newline=False),
-    Knob("clear_elements", "button", "Remove All", script=CLEAR_SCRIPT, newline=False),
-    text("elements_info", "Each element below opens to show its controls."),
 ]
+
+# Knobs on the tabs after Elements (3D, Output). Element knobs are inserted
+# before them.
+AFTER_ELEMENTS = [k.name for k in KNOBS[[k.name for k in KNOBS].index("tab_3d"):]]
+ELEMENTS_TAB_END = "elements_info"
 
 # Kernel params driven by expressions rather than a single group knob.
 # Values are per-channel expressions evaluated on the kernel node; the
@@ -343,7 +341,7 @@ NON_LOOK_KNOBS = {
     "offscreen_fade", "occlusion_enable", "occlusion_mode", "occlusion_radius",
     "occlusion_samples", "occlusion_invert", "light_depth",
     "source_intensity", "source_color", "source_radius", "source_black", "source_white",
-    "preset", "dirt_enable", "output_mode", "solo", "element_layers", "render_region",
+    "preset", "output_mode", "solo", "element_layers", "render_region",
     "motion_blur",
 }
 

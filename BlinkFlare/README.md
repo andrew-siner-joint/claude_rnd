@@ -13,6 +13,7 @@ the GPU when one is available and falls back to vectorized CPU otherwise.
 
 ## Elements
 
+The panel's tabs are **Flare**, **Lens**, **Elements**, **3D** and **Output**.
 The **Elements** tab holds the stack. Pick a type under **New Element** and
 press **Add**; add as many as you like, of any type. Each element is a
 collapsible group, titled with its number and type, with:
@@ -57,8 +58,6 @@ The **Lens** tab sets what every element shares:
   into cat's-eyes as the light moves off-centre, like the barrel of a real
   lens vignetting them.
 - **Coatings**: three colours that Ghost Set (via Coating Mix) picks from.
-- **Lens Dirt**: a texture on the `dirt` input, lit by a glow around the light
-  and by the flare itself.
 
 ## Lens System: physically based ghosts
 
@@ -114,7 +113,6 @@ evaluates Python at render time, and the kernel never recompiles.
 |---|---|
 | `src` | The plate. Sets the render format, and is sampled when the flare follows the source. |
 | `occlusion` | Matte (alpha) or CG render (depth.Z) of whatever passes in front of the light. |
-| `dirt` | Lens dirt texture, fitted to the frame automatically. |
 | `cam` | Camera, for 3D placement. Dots in between are fine. |
 | `axis` | Axis, Light, or any 3D transform marking the light in 3D. |
 | `mask` | Standard effect mask (alpha) on the composite. |
@@ -203,11 +201,11 @@ with resolution.
   *Flare Only* (on black, for stacking or comping yourself). The source alpha
   and other layers pass through untouched.
 - **Solo** shows one pass while you tune it. Every element belongs to a pass,
-  by type or by its **Layer** menu: Glow, Rays, Streaks, Ghosts, Rings, Other
-  or Dirt.
+  by type or by its **Layer** menu: Glow, Rays, Streaks, Ghosts, Rings or
+  Other.
 - **Element Layers** also writes each pass to its own layer (`flare_glow`,
   `flare_rays`, `flare_streaks`, `flare_ghosts`, `flare_rings`,
-  `flare_other`, `flare_dirt`), so ghosts or streaks can be graded separately
+  `flare_other`), so ghosts or streaks can be graded separately
   downstream. An element's **Layer** menu moves it to another pass, e.g.
   *Other* to split one ghost out from the rest. The first time you switch it
   on, the node builds one solo kernel per pass from its own compiled kernel,
@@ -247,6 +245,12 @@ Preset files from BlinkFlare 2 (fixed element tabs) are skipped.
 
 Requires NukeX or Nuke Studio 13 or later (Python 3) to build the node.
 
+Upgrading from 3.0: 3.1 drops the lens dirt input and controls, and moves the
+Elements tab before 3D and Output. Nodes already in your scripts keep working
+as they were, since each node carries its own kernel; they switch to the new
+tab order the first time you add an element. The kernel changed, so the first
+new node compiles once.
+
 ### Easiest: the installer script
 
 1. Copy the `BlinkFlare` folder somewhere permanent, and restart Nuke if an
@@ -261,8 +265,10 @@ A progress window (with Cancel) shows each step, and Nuke stays responsive
 throughout:
 1. It compiles a tiny test kernel, then the BlinkFlare kernel, timing both.
 2. It builds a test node, caching the compiled kernel along the way. It then
-   reads that node's element table back from Nuke and checks it against the
-   values it should hold.
+   lists the node's inputs as Nuke numbers them, reads the element table back
+   from Nuke and checks it against the values it should hold, and checks that
+   adding an element keeps the tabs in order and the 3D and Output settings
+   intact.
 3. It offers to add BlinkFlare to `~/.nuke/init.py`, and puts the menu in
    place for the current session.
 
@@ -366,7 +372,9 @@ build that image. Their expressions read the element knobs directly, so
 keyframes, expressions and links on any element knob just work, and on a
 render farm too. Adding, removing or retyping an element rewrites those
 expressions and the kernel's `elementCount`. The kernel itself never
-recompiles.
+recompiles. Nuke can only append knobs to a node, so to keep the 3D and Output
+tabs after Elements, adding an element takes those tabs' knobs off, appends the
+element, and puts them back, restoring their values and links.
 
 `spec.py` and `elements.py` are the single source of truth: the tests check
 that the kernel's params, type codes and defaults, the spec, the builder and
@@ -388,7 +396,7 @@ Nuke isn't needed to run the tests:
 
 ```sh
 pip install numpy pillow
-python3 -m unittest discover -s tests          # 176 tests
+python3 -m unittest discover -s tests          # 182 tests
 python3 tests/harness/preview.py --preset "Classic Anamorphic" --out flare.png
 python3 tests/harness/preview.py --preset "Physical 50mm" --set anamorphic=0.6 --out flare.png
 cd tests/harness && python3 preview.py --docs ../../docs/previews   # README images
@@ -418,6 +426,10 @@ assumptions need a first run in NukeX before production use:
   on what the .nk kept. Element edits pause undo with `nuke.Undo().disable()`
   and `enable()`; the Delete button defers the removal of its own knob to the
   next event-loop turn.
+- **Moving knobs.** Keeping 3D and Output after Elements relies on removing
+  those knobs and adding them back. Values, animation and links are
+  snapshotted and restored in case Nuke drops them; the installer adds and
+  removes an element on its test node to check this.
 - **BlinkScript knob names.** Param knobs are assumed to be
   `BlinkFlareKernel_<param>`, and the GPU and vectorize toggles to be
   `useGPUIfAvailable` and `vectorize`. The builder falls back to searching

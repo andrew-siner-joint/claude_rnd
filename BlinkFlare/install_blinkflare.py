@@ -252,7 +252,7 @@ kernel ProbeRandom : ImageComputationKernel<ePixelWise>
 {
   Image<eRead, eAccessRandom, eEdgeClamped> src;
   Image<eRead, eAccessRandom, eEdgeConstant> occlusion;
-  Image<eRead, eAccessPoint, eEdgeConstant> dirt;
+  Image<eRead, eAccessPoint, eEdgeConstant> extra;
   Image<eWrite> dst;
 
   param:
@@ -267,8 +267,8 @@ kernel ProbeRandom : ImageComputationKernel<ePixelWise>
   {
     float4 a = bilinear(src, probeAt.x, probeAt.y);
     float4 o = bilinear(occlusion, probeAt.x, probeAt.y);
-    float4 dv = dirt();
-    dst() = float4(a.x + o.w + dv.x, a.y, a.z, 1.0f);
+    float4 e = extra();
+    dst() = float4(a.x + o.w + e.x, a.y, a.z, 1.0f);
   }
 };
 """),
@@ -316,6 +316,59 @@ def stub_functions(source, keep):
 # --------------------------------------------------------------- the checks
 
 TABLE_SCALE = 9  # table cells become 9x9 blocks, so sample() filtering can't mix them
+TAB_ORDER = ["tab_flare", "tab_lens", "tab_elements", "tab_3d", "tab_output"]
+
+
+def check_inputs(rep, group):
+    """List the group's inputs the way Nuke numbers them."""
+    from blinkflare import camera
+    inputs = [n for n in group.nodes() if n.Class() == "Input"]
+    number = lambda n: int(n["number"].value()) if n.knob("number") is not None else -1  # noqa: E731
+    inputs.sort(key=number)
+    rep("inputs: %s (the node shows %d)" % (
+        ", ".join("%d %s" % (number(n), n.name()) for n in inputs), group.maxInputs()))
+    expected = {"cam": camera.CAMERA_INPUT, "axis": camera.AXIS_INPUT, "mask": camera.MASK_INPUT}
+    got = dict((n.name(), number(n)) for n in inputs)
+    wrong = [name for name, index in expected.items() if got.get(name) != index]
+    if wrong or group.maxInputs() != len(expected) + 2:
+        rep.problem("The node's inputs aren't numbered as expected (%s)." % ", ".join(wrong or ["count"]))
+
+
+def check_panel(rep, group):
+    """Adding an element must land between the Elements and 3D tabs, and
+    keep the 3D/Output knobs' values and links (they're lifted off and put
+    back, as Nuke can only append knobs)."""
+    from blinkflare import builder, elements, spec
+    names = [k.name() for k in group.allKnobs()]
+    tabs = [n for n in names if n in TAB_ORDER]
+    if tabs != TAB_ORDER:
+        rep.problem("Tabs are in the order %s." % ", ".join(tabs))
+    probe = {"output_mode": 1, "solo": 2}
+    original = dict((n, group[n].toScript()) for n in probe)
+    links = dict((n, builder._link_target(group[n])) for n in ("operation", "mix", "use_gpu")
+                 if group.knob(n) is not None)
+    try:
+        for n, v in probe.items():
+            group[n].setValue(v)
+        expected = dict((n, group[n].toScript()) for n in probe)
+        eid = builder.add_element(group, "Glow")
+        names = [k.name() for k in group.allKnobs()]
+        issues = []
+        begin = elements.knob_name(eid, "begin")
+        if not names.index(spec.ELEMENTS_TAB_END) < names.index(begin) < names.index("tab_3d"):
+            issues.append("a new element's knobs landed outside the Elements tab")
+        issues += ["%s changed" % n for n in probe if group[n].toScript() != expected[n]]
+        issues += ["%s lost its link" % n for n, target in links.items()
+                   if group.knob(n) is None or builder._link_target(group[n]) != target]
+        builder.remove_element(group, eid)
+    finally:
+        for n, script in original.items():
+            group[n].fromScript(script)
+    if issues:
+        rep.problem("Adding an element upset the panel: " + "; ".join(issues))
+    else:
+        rep("ok    panel: tabs in order, new elements land on the Elements tab, "
+            "3D/Output settings kept")
 
 
 def check_table(rep, group):
@@ -580,11 +633,13 @@ class Diagnostic(object):
             self.built = group
             self.rep("Built %s; the compiled kernel is cached, so new BlinkFlare nodes are "
                      "instant from now on." % group.name())
-            try:
-                check_table(self.rep, group)
-            except Exception:
-                self.rep.problem("Checking the element table failed:")
-                self.rep(traceback.format_exc())
+            for title, check in (("inputs", check_inputs), ("element table", check_table),
+                                 ("panel", check_panel)):
+                try:
+                    check(self.rep, group)
+                except Exception:
+                    self.rep.problem("Checking the %s failed:" % title)
+                    self.rep(traceback.format_exc())
         else:
             self.rep.problem("Building the node failed:")
             for e in errors:

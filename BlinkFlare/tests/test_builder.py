@@ -72,15 +72,16 @@ class GraphTest(BuilderBase):
 
     def test_inputs(self):
         inputs = [c.name() for c in self.group.children() if c.Class() == "Input"]
-        self.assertEqual(inputs, ["src", "occlusion", "dirt", "cam", "axis", "mask"])
+        self.assertEqual(inputs, ["src", "occlusion", "cam", "axis", "mask"])
+        self.assertEqual(self.group.maxInputs(), 5)
         self.assertEqual(inputs.index("cam"), camera.CAMERA_INPUT)
         self.assertEqual(inputs.index("axis"), camera.AXIS_INPUT)
         self.assertEqual(inputs.index("mask"), camera.MASK_INPUT)
 
     def test_kernel_wired(self):
-        self.assertEqual(self.blink.maxInputs(), 4)
-        self.assertEqual([self.blink.input(i).name() for i in range(4)],
-                         ["Canvas", "OcclusionDepth", "DirtFit", "TableRow%d" % (elements.ROWS - 1)])
+        self.assertEqual(self.blink.maxInputs(), 3)
+        self.assertEqual([self.blink.input(i).name() for i in range(3)],
+                         ["Canvas", "OcclusionDepth", "TableRow%d" % (elements.ROWS - 1)])
         chain = [self.group.child("TableRow%d" % r) for r in range(elements.ROWS)]
         self.assertEqual(chain[0].input(0).name(), "TableCrop")
         self.assertEqual(self.group.child("TableCrop").input(0).name(), "TableBase")
@@ -127,11 +128,20 @@ class GraphTest(BuilderBase):
         check_references(self, self.group)
 
     def test_group_knobs_in_spec_order_with_defaults(self):
-        expected = [k.name for k in spec.KNOBS] + ["element_ids", "blinkflare_version"]
+        static = [k.name for k in spec.KNOBS]
+        end = static.index(spec.ELEMENTS_TAB_END) + 1
+        before = static[:end] + ["element_ids", "blinkflare_version"]
         order = self.group.user_knob_order
-        self.assertEqual(order[:len(expected)], expected)
-        # Then the Default preset's elements, appended to the Elements tab.
-        self.assertTrue(all(n.startswith("e") and n[1].isdigit() for n in order[len(expected):]))
+        tabs = [n for n in order if n.startswith("tab_")]
+        self.assertEqual(tabs, ["tab_flare", "tab_lens", "tab_elements", "tab_3d", "tab_output"])
+        self.assertEqual(order[:len(before)], before)
+        # Then the Default preset's elements, then the 3D and Output tabs.
+        after = static[end:]
+        self.assertEqual(after, spec.AFTER_ELEMENTS)
+        self.assertEqual(order[-len(after):], after)
+        middle = order[len(before):-len(after)]
+        self.assertTrue(middle)
+        self.assertTrue(all(n.startswith("e") and n[1].isdigit() for n in middle))
         self.assertFalse(self.group["element_ids"].visible)
         self.assertEqual(self.group["blinkflare_version"].value(), spec.VERSION)
         looks = presets.PRESETS["Default"]["globals"]
@@ -404,8 +414,9 @@ class ElementLayersTest(BuilderBase):
             solo = builder.param_knob(inst, "soloPass")
             self.assertEqual((solo.value(), solo.expressions), (index, {}))
             self.assertEqual(inst["disable"].expressions[0], "1 - parent.element_layers")
-            self.assertEqual([inst.input(i) for i in range(4)],
-                             [self.blink.input(i) for i in range(4)])
+            self.assertEqual([inst.input(i) for i in range(3)],
+                             [self.blink.input(i) for i in range(3)])
+            self.assertIsNotNone(inst.input(2))
             stream = self.group.child("Layer_" + name)
             comp = self.group.child("CompLayer_" + name)
             self.assertEqual([stream.input(0), stream.input(1)], [prev_stream, inst])
@@ -577,6 +588,90 @@ class ElementStackTest(BuilderBase):
             for r in range(elements.ROWS):
                 for c in range(4):
                     self.assertAlmostEqual(g[r][c], w[r][c], places=places, msg=(x, r, c))
+
+    def assertPanelOrder(self):
+        """Element knobs sit between the Elements tab and the 3D tab."""
+        order = self.group.user_knob_order
+        tail = [n for n in spec.AFTER_ELEMENTS if self.group.knob(n) is not None]
+        self.assertEqual(order[-len(tail):], tail)
+        first_after = order.index(tail[0])
+        for eid in builder.element_ids(self.group):
+            for field, _ in builder._element_knobs(eid):
+                name = elements.knob_name(eid, field)
+                self.assertGreater(order.index(name), order.index("elements_info"), name)
+                self.assertLess(order.index(name), first_after, name)
+
+    def tweak_later_tabs(self):
+        """Values, animation and links on the 3D and Output tabs."""
+        self.group["output_mode"].setValue(1)
+        self.group["solo"].setValue(3)
+        self.group["motion_blur"].setValueAt(True, 1001)
+        self.group["render_region"].setExpression("frame > 1005")
+        return {name: self.group[name].toScript()
+                for name in ("output_mode", "solo", "motion_blur", "render_region")}
+
+    def assertLaterTabsKept(self, saved):
+        for name, script in saved.items():
+            self.assertEqual(self.group[name].toScript(), script, name)
+        for k in spec.KNOBS:
+            if k.kind == "link" and k.name in spec.AFTER_ELEMENTS:
+                knob = self.group.knob(k.name)
+                if knob is not None:
+                    node_name, knob_name = knob.getLink().split(".")
+                    self.assertIsNotNone(self.group.child(node_name).knob(knob_name), k.name)
+
+    def test_new_elements_go_before_the_3d_and_output_tabs(self):
+        self.assertPanelOrder()
+        saved = self.tweak_later_tabs()
+        builder.add_element(self.group, "Streak")
+        builder.duplicate_element(self.group, builder.element_ids(self.group)[0])
+        self.assertPanelOrder()
+        self.assertLaterTabsKept(saved)
+        builder.apply_preset(self.group, "Classic Anamorphic")
+        self.assertPanelOrder()
+        self.assertLaterTabsKept(saved)
+
+    def test_later_tabs_restored_even_if_removing_knobs_loses_state(self):
+        saved = self.tweak_later_tabs()
+        fake_nuke.REMOVE_KNOB_RESETS[0] = True
+        builder.add_element(self.group, "Ring")
+        builder.apply_preset(self.group, "Physical 50mm")
+        self.assertPanelOrder()
+        self.assertLaterTabsKept(saved)
+
+    def test_lift_puts_knobs_back_after_an_error(self):
+        before = list(self.group.user_knob_order)
+        with self.assertRaises(KeyError):
+            with builder._AfterElementsLifted(self.group):
+                self.assertIsNone(self.group.knob("tab_3d"))
+                raise KeyError("boom")
+        self.assertEqual(self.group.user_knob_order, before)
+
+    def test_failed_lift_puts_back_what_came_off(self):
+        before = list(self.group.user_knob_order)
+        remove = self.group.removeKnob
+
+        def flaky(knob):
+            if knob.name() == "solo":
+                raise RuntimeError("Nuke said no")
+            remove(knob)
+        self.group.removeKnob = flaky
+        with self.assertRaises(RuntimeError):
+            with builder._AfterElementsLifted(self.group):
+                self.fail("should not get here")
+        self.assertEqual(self.group.user_knob_order, before)
+
+    def test_older_layout_is_reordered_on_first_add(self):
+        # 3.0 nodes had Elements as the last tab.
+        order = self.group._user_order
+        after = [n for n in order if n in spec.AFTER_ELEMENTS]
+        rest = [n for n in order if n not in spec.AFTER_ELEMENTS]
+        cut = rest.index("tab_elements")
+        order[:] = rest[:cut] + after + rest[cut:]
+        builder.add_element(self.group, "Glow")
+        tabs = [n for n in self.group.user_knob_order if n.startswith("tab_")]
+        self.assertEqual(tabs, ["tab_flare", "tab_lens", "tab_elements", "tab_3d", "tab_output"])
+        self.assertPanelOrder()
 
     def test_table_matches_the_stack(self):
         self.assertTableMatches()
