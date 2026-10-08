@@ -143,10 +143,22 @@ elif _k is not None and _k.name() == "element_layers" and _k.value():
 REFRESH_SCRIPT = LINK_FUNCTION + "\n_blinkflare_links(nuke.thisNode())\n"
 
 
+def _script_values(merge_node):
+    return {"proj": PROJECTION_NODE, "cam": CAMERA_INPUT, "mask": MASK_INPUT,
+            "lens": LENS_KNOBS, "merge": merge_node}
+
+
 def link_scripts(merge_node):
-    values = {"proj": PROJECTION_NODE, "cam": CAMERA_INPUT, "mask": MASK_INPUT,
-              "lens": LENS_KNOBS, "merge": merge_node}
+    values = _script_values(merge_node)
     return KNOB_CHANGED_SCRIPT % values, REFRESH_SCRIPT % values
+
+
+def link_now(node, merge_node, nuke_module):
+    """Run the stored link function on ``node`` straight away (camera lens
+    knobs and mask), as its knobChanged would on an input change."""
+    namespace = {"nuke": nuke_module}
+    exec(LINK_FUNCTION % _script_values(merge_node), namespace)
+    namespace["_blinkflare_links"](node)
 
 
 # ----------------------------------------------------------------- reference

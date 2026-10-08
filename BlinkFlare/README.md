@@ -245,12 +245,6 @@ Preset files from BlinkFlare 2 (fixed element tabs) are skipped.
 
 Requires NukeX or Nuke Studio 13 or later (Python 3) to build the node.
 
-Upgrading from 3.0: 3.1 drops the lens dirt input and controls, and moves the
-Elements tab before 3D and Output. Nodes already in your scripts keep working
-as they were, since each node carries its own kernel; they switch to the new
-tab order the first time you add an element. The kernel changed, so the first
-new node compiles once.
-
 ### Easiest: the installer script
 
 1. Copy the `BlinkFlare` folder somewhere permanent, and restart Nuke if an
@@ -315,6 +309,7 @@ let BlinkFlare build around it:
 | *"BlinkFlare's Blink kernel did not compile..."* | Run **Check Install...** for the reason (licence, a rejected kernel function, or a compile that never finishes), or use the by-hand route above. |
 | Nuke froze while installing (older `install_blinkflare.py`) | Force-quit Nuke and use the current installer. It never blocks Nuke while waiting for a compile. |
 | *"Nuke had a different BlinkFlare copy loaded"* (in the report) | An older copy is on the plugin path. Remove or update that `pluginAddPath` line, then restart Nuke. |
+| A node still has a `dirt` input, or the old tab order | It was built by an older BlinkFlare (see the version at the bottom of its Flare tab). Run **Upgrade Selected** on it. |
 | No BlinkFlare menu | `init.py` doesn't reach the folder, or Nuke wasn't restarted. Check Install fixes the menu for the current session. |
 
 ### Sharing with plain-Nuke seats
@@ -324,6 +319,25 @@ BlinkFlare > Save ToolSet**, which writes a ready-built node with the compiled
 kernel to `~/.nuke/ToolSets/BlinkFlare.nk`; share it like any ToolSet. Saved
 scripts render without the package. Only the buttons (presets, bake, building
 element layers) need it.
+
+### Upgrading existing nodes
+
+Each BlinkFlare node carries its own kernel and controls, so nodes already in
+a script stay the version that built them (the bottom of the Flare tab shows
+it, e.g. *BlinkFlare v3.0.0*). They keep rendering as they did; a 3.0 node
+still has its `dirt` input, for example.
+
+To bring them up to date, select them and run **Draw > BlinkFlare > Upgrade
+Selected**. With nothing selected it offers to upgrade every older node in the
+script. Each node is rebuilt in place, under the same name, keeping its
+settings, keyframes and expressions, its element stack, and its input and
+output connections; a message lists anything that couldn't come across (such
+as a connected `dirt` input). Nodes from BlinkFlare 2, before element stacks,
+keep their placement and pipeline settings and start from the Default look.
+The installer also points out older nodes in the open script.
+
+A ToolSet saved with an older version (**Save ToolSet**) builds that older
+node; save it again after updating.
 
 ## Performance
 
@@ -396,7 +410,7 @@ Nuke isn't needed to run the tests:
 
 ```sh
 pip install numpy pillow
-python3 -m unittest discover -s tests          # 182 tests
+python3 -m unittest discover -s tests          # 192 tests
 python3 tests/harness/preview.py --preset "Classic Anamorphic" --out flare.png
 python3 tests/harness/preview.py --preset "Physical 50mm" --set anamorphic=0.6 --out flare.png
 cd tests/harness && python3 preview.py --docs ../../docs/previews   # README images
@@ -445,6 +459,10 @@ assumptions need a first run in NukeX before production use:
   `invert_mask`, AddChannels `channels2`, Copy `from0`/`to0`, and Transform
   `scale`/`center`/`filter` (installer only). Missing link knobs are skipped
   rather than failing.
+- **Upgrading** finds the nodes connected to the old node with
+  `dependent()`, reaches nodes inside groups with `nuke.toNode("root.…")`, and
+  copies knobs with `toScript()`/`fromScript()`. It's tested against a real
+  3.0 node built by the 3.0 code, but only in the stand-in Nuke.
 - **Callbacks.** The `inputChange` and `showPanel` events need to fire on the
   group, for the camera link, the mask and the element panel. Element knob
   changes go through the group's `knobChanged`.
