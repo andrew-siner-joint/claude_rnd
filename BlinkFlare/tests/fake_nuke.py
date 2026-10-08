@@ -230,11 +230,6 @@ class Enumeration_Knob(Knob):
     def getValue(self, channel=0):
         return float(self.values[0])
 
-    def fromScript(self, text):
-        Knob.fromScript(self, text)
-        if not all(0 <= v < len(self.items) for v in self.values):
-            raise ValueError("%s has no item %r" % (self._name, self.values))
-
     def setValues(self, items):
         self.items = list(items)
         self.values = [min(self.values[0], len(self.items) - 1)]
@@ -506,14 +501,6 @@ class Node(object):
     def input(self, i):
         return self._inputs.get(i)
 
-    def inputs(self):
-        return max(self._inputs) + 1 if self._inputs else 0
-
-    def dependent(self, what=7, forceEvaluate=True):
-        """Nodes beside this one that use it as an input."""
-        siblings = self._parent._children if self._parent is not None else []
-        return [n for n in siblings if any(v is self for v in n._inputs.values())]
-
     def setXYpos(self, x, y):
         self._xy = (x, y)
 
@@ -757,22 +744,6 @@ def selectedNode():
 
 def selectedNodes():
     return list(_selected)
-
-
-INPUTS, HIDDEN_INPUTS, EXPRESSIONS = 1, 2, 4
-
-
-def allNodes(filter=None, group=None, recurseGroups=False):
-    found = []
-
-    def walk(parent):
-        for n in parent._children:
-            if filter is None or n._class == filter:
-                found.append(n)
-            if recurseGroups and n._class == "Group":
-                walk(n)
-    walk(group or _current())
-    return found
 
 
 def delete(node):

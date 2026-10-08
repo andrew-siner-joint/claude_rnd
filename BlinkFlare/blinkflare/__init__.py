@@ -46,13 +46,6 @@ def save_preset(node, name=None):
     return builder.save_preset(node, name)
 
 
-def upgrade_selected():
-    """Rebuild the selected (or every older) BlinkFlare node with this version,
-    keeping settings, keyframes, elements and connections."""
-    from blinkflare import builder
-    return builder.upgrade_selected()
-
-
 def refresh_panel(node):
     """Panel opened or inputs changed: refresh the preset menu and the
     element knobs' labels and visibility."""

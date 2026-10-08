@@ -142,18 +142,6 @@ class InstallerTest(unittest.TestCase):
         self.assertIn("inputs: 0 src, 1 occlusion, 2 cam, 3 mask, 4 axis", rep.text())
         self.assertRegex(rep.problems[0], r"inputs aren't numbered as expected \((axis, mask|mask, axis)\)")
 
-    def test_older_nodes_in_the_script_are_pointed_out(self):
-        with fake_nuke.root():
-            old = fake_nuke.nodes.Group(name="OldFlare")
-        with old:
-            fake_nuke.nodes.BlinkScript(name="FlareKernel")
-        old.addKnob(fake_nuke.XY_Knob("light_pos", "Light Position"))
-        report = self.run_main()
-        self.assertIn("note: 1 BlinkFlare node in this script was built by an older version "
-                      "(OldFlare v2)", report)
-        self.assertIn("Upgrade Selected", report)
-        self.assertNotIn("PROBLEM", report)
-
     def test_diagnose_entry_point_runs_installer(self):
         sys.path.insert(0, ROOT)
         import blinkflare

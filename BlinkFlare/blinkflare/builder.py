@@ -425,7 +425,7 @@ def build_internals(group, template):
     return blink
 
 
-def build_group(sel, fmt, template, show_panel=True):
+def build_group(sel, fmt, template):
     group = nuke.nodes.Group()
     try:
         group.setName("BlinkFlare1")
@@ -443,7 +443,7 @@ def build_group(sel, fmt, template, show_panel=True):
     for n in nuke.selectedNodes():
         n.setSelected(False)
     group.setSelected(True)
-    if nuke.GUI and show_panel:
+    if nuke.GUI:
         group.showControlPanel()
     return group
 
@@ -457,19 +457,12 @@ def create(on_done=None, on_error=None):
     or ``on_error(message)`` if it can't be built.
     """
     sel, fmt = _input_format()
-    return _when_kernel_ready(lambda template: build_group(sel, fmt, template),
-                              on_done, on_error or show_error)
-
-
-def _when_kernel_ready(build, on_done, on_error):
-    """Run ``build(template)`` once the compiled kernel is available: at once
-    when it's cached (returning the result), otherwise after a background
-    compile (``on_done(result)``, or ``on_error(message)``)."""
+    on_error = on_error or show_error
     built = []
 
     def ready(template, retry=True):
         try:
-            result = build(template)
+            group = build_group(sel, fmt, template)
         except StaleTemplate:
             os.remove(template)
             if retry:
@@ -480,9 +473,9 @@ def _when_kernel_ready(build, on_done, on_error):
         except Exception:
             on_error("Building BlinkFlare failed:\n" + traceback.format_exc())
             return
-        built.append(result)
+        built.append(group)
         if on_done is not None:
-            on_done(result)
+            on_done(group)
 
     kernel_template(ready, on_error)
     return built[0] if built else None
@@ -1019,168 +1012,6 @@ def element_knob_changed(node, knob):
                     _set_element_value(target, f, value)
             apply_type_ui(node, eid)
         rebuild_table(node)
-
-
-# ---------------------------------------------------------------- upgrading
-# Each node carries its own kernel and knobs, so a node built by an older
-# BlinkFlare stays that version. Upgrading rebuilds it with this version and
-# carries its settings, keyframes, elements and connections across.
-
-def is_blinkflare(node):
-    return (node is not None and node.Class() == "Group"
-            and node.node(spec.KERNEL_NODE) is not None and node.knob("light_pos") is not None)
-
-
-def node_version(node):
-    """The BlinkFlare version that built ``node`` ("2" before versions were stored)."""
-    knob = node.knob("blinkflare_version")
-    return knob.value() if knob is not None else "2"
-
-
-def _version_key(text):
-    return tuple(int(p) if p.isdigit() else 0 for p in text.split("."))
-
-
-def is_outdated(node):
-    return is_blinkflare(node) and _version_key(node_version(node)) < _version_key(spec.VERSION)
-
-
-def _input_indices(group):
-    """Input name -> index, as Nuke numbers the group's Input nodes."""
-    return dict((n.name(), int(n["number"].value()))
-                for n in group.nodes() if n.Class() == "Input")
-
-
-def _parent_of(node):
-    path = node.fullName().rsplit(".", 1)
-    return nuke.toNode("root." + path[0]) if len(path) == 2 else nuke.root()
-
-
-def _copy_knob(src, dst):
-    """Value, keyframes or expression of ``src`` onto ``dst``; False (and
-    ``dst`` untouched) when it doesn't fit, e.g. a menu item that's gone."""
-    backup = dst.toScript()
-    try:
-        dst.fromScript(src.toScript())
-        return True
-    except (ValueError, RuntimeError, IndexError, TypeError):
-        dst.fromScript(backup)
-        return False
-
-
-def _transfer(old, new):
-    """Copy an older node's settings, elements and connections onto ``new``.
-    Returns notes on anything that couldn't come across."""
-    notes = []
-    for k in spec.value_knobs():
-        src, dst = old.knob(k.name), new.knob(k.name)
-        if src is not None and dst is not None and not _copy_knob(src, dst):
-            notes.append("%s was reset (%s isn't an option any more)" % (k.label, src.toScript()))
-    for k in spec.KNOBS:
-        a, b = (_resolve_link(g, k) if k.kind == "link" else None for g in (old, new))
-        if a and b:
-            _copy_knob(old.node(a.split(".")[0])[a.split(".")[1]],
-                       new.node(b.split(".")[0])[b.split(".")[1]])
-    if old.knob("dirt_enable") is not None and old["dirt_enable"].value():
-        notes.append("lens dirt was on; BlinkFlare no longer has it")
-
-    if old.knob("element_ids") is not None:
-        clear_elements(new, rebuild=False)
-        with _NoUndo(), _AfterElementsLifted(new):
-            for eid in element_ids(old):
-                el = element_values(old, eid)
-                nid = add_element(new, el["type"], el, rebuild=False)
-                for field in elements.VALUE_FIELDS:
-                    src = old.knob(elements.knob_name(eid, field))
-                    dst = new.knob(elements.knob_name(nid, field))
-                    if src is not None and dst is not None and src.isAnimated():
-                        _copy_knob(src, dst)
-        rebuild_table(new)
-    else:
-        notes.append("it predates element stacks, so its look starts from the Default preset")
-
-    old_inputs, new_inputs = _input_indices(old), _input_indices(new)
-    for name, index in sorted(old_inputs.items(), key=lambda item: item[1]):
-        source = old.input(index)
-        if source is None:
-            continue
-        if name in new_inputs:
-            new.setInput(new_inputs[name], source)
-        else:
-            notes.append("its '%s' input (%s) was disconnected" % (name, source.name()))
-    what = getattr(nuke, "INPUTS", 1) | getattr(nuke, "HIDDEN_INPUTS", 2)
-    for user in old.dependent(what, False):
-        for i in range(user.inputs()):
-            if user.input(i) == old:
-                user.setInput(i, new)
-    for name in ("label", "tile_color", "hide_input", "postage_stamp"):
-        if old.knob(name) is not None and new.knob(name) is not None:
-            _copy_knob(old[name], new[name])
-    return notes
-
-
-def upgrade(node, on_done=None, on_error=None):
-    """Rebuild ``node`` with this version of BlinkFlare, in its place and
-    under its name. Returns (new_node, notes) when the compiled kernel is
-    cached; otherwise ``on_done((new_node, notes))`` after it compiles."""
-    if not is_blinkflare(node):
-        raise BuildError("%s isn't a BlinkFlare node." % node.name())
-    parent = _parent_of(node)
-
-    def build(template):
-        with parent:
-            new = build_group(None, node.format(), template, show_panel=False)
-            try:
-                notes = _transfer(node, new)
-                name, x, y = node.name(), node.xpos(), node.ypos()
-                nuke.delete(node)
-            except Exception:
-                nuke.delete(new)
-                raise
-            new.setName(name)
-            new.setXYpos(x, y)
-            if new["element_layers"].value():
-                build_element_layers(new)
-            camera.link_now(new, spec.MERGE_NODE, nuke)
-        return new, notes
-
-    return _when_kernel_ready(build, on_done, on_error or show_error)
-
-
-def upgrade_selected():
-    """Upgrade the selected BlinkFlare nodes; with none selected, offer to
-    upgrade every older one in the script. Reports what happened."""
-    nodes = [n for n in nuke.selectedNodes() if is_blinkflare(n)]
-    if not nodes:
-        nodes = [n for n in nuke.allNodes("Group", recurseGroups=True) if is_outdated(n)]
-        if not nodes:
-            nuke.message("No BlinkFlare nodes need upgrading (this is v%s)." % spec.VERSION)
-            return []
-        if not nuke.ask("Upgrade all %d older BlinkFlare nodes in this script to v%s?"
-                        % (len(nodes), spec.VERSION)):
-            return []
-    pending, done, failed = list(nodes), [], []
-
-    def step(result=None):
-        if result is not None:
-            done.append(result)
-        if not pending:
-            lines = ["Upgraded %d BlinkFlare node%s to v%s." % (
-                len(done), "" if len(done) == 1 else "s", spec.VERSION)]
-            lines += ["%s: %s" % (new.name(), note) for new, notes in done for note in notes]
-            lines += ["%s failed: %s" % (name, message) for name, message in failed]
-            nuke.message("\n".join(lines))
-            return
-        node = pending.pop(0)
-        name = node.name()
-
-        def failed_one(message, name=name):
-            failed.append((name, message))
-            step()
-        upgrade(node, on_done=step, on_error=failed_one)
-
-    step()
-    return done
 
 
 # ------------------------------------------------------------------ toolset

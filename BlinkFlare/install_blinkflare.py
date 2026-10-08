@@ -711,21 +711,6 @@ class Diagnostic(object):
                 "BlinkFlare built fine. Keep the test node %s?" % self.built.name()):
             nuke.delete(self.built)
         try:
-            older = [n for n in nuke.allNodes("Group", recurseGroups=True)
-                     if self.builder.is_outdated(n)]
-            if older:
-                self.rep("")
-                self.rep("note: %d BlinkFlare node%s in this script %s built by an older version "
-                         "(%s). They keep working as they were; to bring them up to date, select "
-                         "them and run Draw > BlinkFlare > Upgrade Selected (with nothing "
-                         "selected it offers to upgrade them all)." % (
-                             len(older), "" if len(older) == 1 else "s",
-                             "was" if len(older) == 1 else "were",
-                             ", ".join("%s v%s" % (n.fullName(), self.builder.node_version(n))
-                                       for n in older)))
-        except Exception:
-            self.rep(traceback.format_exc())
-        try:
             install_startup(self.rep, self.root)
         except Exception:
             self.rep.problem("Updating init.py / the menu failed:")
