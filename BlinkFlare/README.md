@@ -403,6 +403,10 @@ python3 tests/harness/preview.py --preset "Physical 50mm" --set anamorphic=0.6 -
 cd tests/harness && python3 preview.py --docs ../../docs/previews   # README images
 ```
 
+Notes for AI agents building tools like this one (Blink rules, compiling
+from Python, the installer, testing without Nuke) are in
+`.claude/skills/nuke-blinkscript-tool/SKILL.md` at the repository root.
+
 When adding a kernel parameter: declare it in the kernel's `param:` block, add
 a `defineParam` with label == variable name, and add a knob to `spec.py` with
 the same default. The tests fail until all three agree. A new element type
