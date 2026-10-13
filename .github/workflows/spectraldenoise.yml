@@ -1,0 +1,77 @@
+# Build SpectralDenoise.ofx.bundle for macOS, Linux and Windows, and run the
+# tests. Download the bundles from the run's Artifacts section.
+name: SpectralDenoise
+
+on:
+  push:
+    paths:
+      - "SpectralDenoise/**"
+      - ".github/workflows/spectraldenoise.yml"
+  pull_request:
+    paths:
+      - "SpectralDenoise/**"
+      - ".github/workflows/spectraldenoise.yml"
+  workflow_dispatch:
+
+jobs:
+  test:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Dependencies
+        run: |
+          sudo apt-get update -q
+          sudo apt-get install -y -q libgl-dev libexpat1-dev
+          python3 -m pip install --break-system-packages numpy scipy pytest
+      - name: Tests (core and plugin through the OFX test host)
+        working-directory: SpectralDenoise/tests
+        run: python3 -m pytest -q
+
+  linux:
+    # Rocky 8 (glibc 2.28, VFX Reference Platform base) so the plugin loads
+    # in current Nuke and Flame releases.
+    runs-on: ubuntu-24.04
+    container: rockylinux:8
+    steps:
+      - name: Toolchain
+        run: |
+          dnf install -y -q gcc-toolset-11 cmake git make mesa-libGL-devel
+      - uses: actions/checkout@v4
+      - name: Build
+        run: |
+          source /opt/rh/gcc-toolset-11/enable
+          cmake -S SpectralDenoise -B build -DCMAKE_BUILD_TYPE=Release
+          cmake --build build -j
+          ldd build/SpectralDenoise.ofx.bundle/Contents/Linux-x86-64/SpectralDenoise.ofx
+      - uses: actions/upload-artifact@v4
+        with:
+          name: SpectralDenoise-linux
+          path: build/SpectralDenoise.ofx.bundle
+
+  macos:
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build (universal arm64 + x86_64)
+        run: SpectralDenoise/build.sh
+      - name: Check architectures
+        run: lipo -info SpectralDenoise/build/SpectralDenoise.ofx.bundle/Contents/MacOS/SpectralDenoise.ofx
+      - name: Zip (keeps the bundle and its signature intact)
+        run: cd SpectralDenoise/build && ditto -c -k --keepParent SpectralDenoise.ofx.bundle SpectralDenoise-macos.zip
+      - uses: actions/upload-artifact@v4
+        with:
+          name: SpectralDenoise-macos
+          path: SpectralDenoise/build/SpectralDenoise-macos.zip
+
+  windows:
+    runs-on: windows-2022
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build
+        run: |
+          cmake -S SpectralDenoise -B build -A x64
+          cmake --build build --config Release -j
+      - uses: actions/upload-artifact@v4
+        with:
+          name: SpectralDenoise-windows
+          path: build/SpectralDenoise.ofx.bundle
