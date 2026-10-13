@@ -4,7 +4,9 @@
 // the core. The noise profile is stored in a hidden string parameter, so it
 // is saved with the script and renders the same everywhere.
 #ifdef _WIN32
+#ifndef NOMINMAX
 #define NOMINMAX
+#endif
 #include <windows.h>
 #endif
 
@@ -634,15 +636,15 @@ public:
         tr_->getValueAtTime(args.time, x2, y2);
         const double px = args.penPosition.x, py = args.penPosition.y;
         const double tx = 2.0 * kHandle * args.pixelScale.x, ty = 2.0 * kHandle * args.pixelScale.y;
-        auto near = [&](double ax, double ay) { return std::fabs(px - ax) <= tx && std::fabs(py - ay) <= ty; };
+        auto hit = [&](double ax, double ay) { return std::fabs(px - ax) <= tx && std::fabs(py - ay) <= ty; };
         drag_ = eNone;
-        if (near(x1, y1))
+        if (hit(x1, y1))
             drag_ = eBL;
-        else if (near(x2, y1))
+        else if (hit(x2, y1))
             drag_ = eBR;
-        else if (near(x2, y2))
+        else if (hit(x2, y2))
             drag_ = eTR;
-        else if (near(x1, y2))
+        else if (hit(x1, y2))
             drag_ = eTL;
         else if (px > std::min(x1, x2) && px < std::max(x1, x2) && py > std::min(y1, y2) && py < std::max(y1, y2))
             drag_ = eBody;
