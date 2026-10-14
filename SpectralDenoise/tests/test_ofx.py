@@ -54,17 +54,33 @@ def render_path(clip, name):
     return os.path.join(clip["dir"], name)
 
 
+def box_profile(clip, frame_index, scale=1, **kw):
+    """What the plugin measures: the box on one frame, as the core does it."""
+    f = clip["noisy"][frame_index]
+    x1, y1, x2, y2 = clip["box"]
+    if scale > 1:
+        h, w = H // scale, W // scale
+        f = f.reshape(h, scale, w, scale, 3).mean((1, 3))
+        x1, y1, x2, y2 = x1 // scale, y1 // scale, -(-x2 // scale), -(-y2 // scale)
+    return sdcore.analyse(flipped([f])[0], region=(x1, y1, x2, y2), **kw)
+
+
+# The plugin keeps its profile in memory, the core's comes back as text that
+# round-trips exactly: renders must match bit for bit.
+ROUNDING = 0.0
+
+
 def test_parameters_described(clip, tmp_path):
     r = ofxhost.run(["describe"], str(tmp_path))
     assert r.code == 0, r
     params = {l.split()[1]: l for l in r.startswith("PARAM")}
     for name in ["profileMode", "analysisBottomLeft", "analysisTopRight", "analyseNoise", "profileStatus",
-                 "profileData", "inputColourspace", "brightnessAdaptive", "noiseLevel", "lumaLevel", "chromaLevel",
+                 "analysisFrame", "inputColourspace", "brightnessAdaptive", "noiseLevel", "lumaLevel", "chromaLevel",
                  "lumaReduction", "chromaReduction", "fineLevel", "mediumLevel", "coarseLevel", "veryCoarseLevel",
                  "sharpen", "temporalRadius", "motionTolerance", "quality", "outputMode", "mix", "maskInvert"]:
         assert name in params, name
-    assert "secret=1" in params["profileData"]
-    assert "secret=0" in params["noiseLevel"]
+    # every parameter is an ordinary visible one: nothing hidden for hosts to drop
+    assert not [l for l in params.values() if "secret=1" in l]
     assert "default=1" in params["temporalRadius"]
 
 
@@ -74,63 +90,76 @@ def test_filter_context_has_no_mask(clip, tmp_path):
     assert not any(" maskInvert " in l for l in r.lines)
 
 
-def test_analyse_stores_profile_and_status(clip, tmp_path):
-    r = ofxhost.run(base(clip, analysed(clip) + ["get profileData", "get profileStatus", "get profileMode"]),
+def test_analyse_records_frame_and_mode(clip, tmp_path):
+    """The button reads no image: it records the frame and switches mode."""
+    r = ofxhost.run(base(clip, analysed(clip) + ["get analysisFrame", "get profileStatus", "get profileMode"]),
                     str(tmp_path))
     assert r.code == 0, r
-    prof = r.values("profileData")
-    assert prof.startswith("SDP1")
-    assert r.values("profileStatus").startswith("Region, frame 1002")
+    assert r.values("analysisFrame") == "1002"
     assert r.values("profileMode") == "0"
-    # identical to the core analysing the same rows and box
-    x1, y1, x2, y2 = clip["box"]
-    ref = sdcore.analyse(flipped([clip["noisy"][2]])[0], region=(x1, y1, x2, y2))
-    assert ref.split()[13:] == prof.split()[13:]
+    assert r.values("profileStatus").startswith("Analysed: the box on frame 1002")
+    assert not r.startswith("MESSAGE")
 
 
-def test_analyse_switches_mode_to_analysed(clip, tmp_path):
-    r = ofxhost.run(base(clip, ["set profileMode 2"] + analysed(clip) + ["get profileMode"]), str(tmp_path))
-    assert r.values("profileMode") == "0"
-
-
-def test_analyse_box_too_small(clip, tmp_path):
-    r = ofxhost.run(base(clip, ["time 1002", "set analysisBottomLeft 10 10", "set analysisTopRight 20 20", "press analyseNoise",
-                                "get profileData"]), str(tmp_path))
-    assert any("24 x 24" in l for l in r.startswith("MESSAGE OfxMessageError")), str(r)
-    assert r.values("profileData") == ""
-
-
-def test_analyse_outside_clip(clip, tmp_path):
-    r = ofxhost.run(base(clip, ["time 5", "press analyseNoise", "get profileData"]), str(tmp_path))
-    assert any("no source frame" in l for l in r.startswith("MESSAGE OfxMessageError")), str(r)
-    assert r.values("profileData") == ""
-
-
-def test_no_profile_falls_back_to_auto(clip, tmp_path):
-    out = render_path(clip, "noprof.raw")
-    r = ofxhost.run(base(clip, ["get profileStatus", "set temporalRadius 0", "render 1002 %s" % out]), str(tmp_path))
+def test_default_is_auto(clip, tmp_path):
+    out = render_path(clip, "default.raw")
+    r = ofxhost.run(base(clip, ["get profileMode", "get profileStatus", "set temporalRadius 0",
+                                "render 1002 %s" % out]), str(tmp_path))
     assert r.code == 0, r
-    assert "No profile yet" in r.values("profileStatus")
+    assert r.values("profileMode") == "2"
+    assert r.values("profileStatus").startswith("Auto")
     img = ofxhost.read_raw(out, W, H)
     auto = sdcore.analyse(flipped([clip["noisy"][2]])[0])
-    # (the core's profile went through text: allow for its 6 digits)
-    np.testing.assert_allclose(img[..., :3], core_render([clip["noisy"][2]], 0, auto)[..., :3], atol=1e-3)
+    np.testing.assert_array_equal(img[..., :3], core_render([clip["noisy"][2]], 0, auto)[..., :3])
+
+
+def test_analysis_frame_is_measured_when_rendering_other_frames(clip, tmp_path):
+    """Analyse on 1000, render 1003: the box on 1000 is the profile, frame
+    1000 is requested and fetched."""
+    out = render_path(clip, "other.raw")
+    r = ofxhost.run(base(clip, analysed(clip, 1000) + ["set temporalRadius 0", "frames 1003",
+                                                        "render 1003 %s" % out]), str(tmp_path))
+    assert r.code == 0, r
+    assert "FRAMES Source 1003:1003 1000:1000" in r.lines
+    fetched = r.startswith("RENDERED")[0].split("fetched:")[1].split()
+    assert sorted(map(int, fetched)) == [1000, 1003]
+    img = ofxhost.read_raw(out, W, H)
+    ref = core_render([clip["noisy"][3]], 0, box_profile(clip, 0))
+    np.testing.assert_allclose(img[..., :3], ref[..., :3], atol=ROUNDING)
+
+
+def test_box_too_small_falls_back_to_auto(clip, tmp_path):
+    a, b = render_path(clip, "small_a.raw"), render_path(clip, "small_b.raw")
+    r = ofxhost.run(base(clip, ["time 1002", "set analysisBottomLeft 10 10", "set analysisTopRight 20 20",
+                                "press analyseNoise", "set temporalRadius 0", "render 1002 %s" % a,
+                                "set profileMode 2", "render 1002 %s" % b]), str(tmp_path))
+    assert r.code == 0, r
+    np.testing.assert_array_equal(ofxhost.read_raw(a, W, H), ofxhost.read_raw(b, W, H))
+
+
+def test_analysis_frame_outside_clip_falls_back_to_auto(clip, tmp_path):
+    """The test host holds the clip's end frames, as Nuke does; a frame
+    beyond the clip measures the held frame and must still render."""
+    out = render_path(clip, "outside.raw")
+    r = ofxhost.run(base(clip, ["time 5", "press analyseNoise", "set temporalRadius 0",
+                                "render 1002 %s" % out]), str(tmp_path))
+    assert r.code == 0, r
+    assert np.all(np.isfinite(ofxhost.read_raw(out, W, H)))
 
 
 @pytest.mark.parametrize("radius", [0, 1, 2])
 def test_render_matches_core(clip, tmp_path, radius):
     out = render_path(clip, "r%d.raw" % radius)
-    r = ofxhost.run(base(clip, analysed(clip) + ["set temporalRadius %d" % radius, "get profileData",
-                                                  "render 1002 %s" % out]), str(tmp_path))
+    r = ofxhost.run(base(clip, analysed(clip) + ["set temporalRadius %d" % radius, "render 1002 %s" % out]),
+                    str(tmp_path))
     assert r.code == 0, r
-    prof = r.values("profileData")
     img = ofxhost.read_raw(out, W, H)
     frames = clip["noisy"][2 - radius:3 + radius]
-    ref = core_render(frames, radius, prof, temporal_radius=radius)
-    np.testing.assert_array_equal(img[..., :3], ref[..., :3])
+    ref = core_render(frames, radius, box_profile(clip, 2), temporal_radius=radius)
+    np.testing.assert_allclose(img[..., :3], ref[..., :3], atol=ROUNDING)
     assert np.all(img[..., 3] == 1.0)
     fetched = r.startswith("RENDERED")[0].split("fetched:")[1].split()
-    assert sorted(map(int, fetched)) == list(range(1002 - radius, 1003 + radius))
+    assert sorted(set(map(int, fetched))) == list(range(1002 - radius, 1003 + radius))
     assert synth.psnr(clip["clean"][2], img) > synth.psnr(clip["clean"][2], clip["noisy"][2]) + 8
 
 
@@ -143,15 +172,15 @@ def test_frames_needed_follow_radius(clip, tmp_path):
 
 def test_clip_start_uses_available_frames(clip, tmp_path):
     out = render_path(clip, "start.raw")
-    r = ofxhost.run(base(clip, analysed(clip) + ["set temporalRadius 2", "get profileData",
-                                                  "render 1000 %s" % out]), str(tmp_path))
+    r = ofxhost.run(base(clip, analysed(clip, 1000) + ["set temporalRadius 2", "render 1000 %s" % out]),
+                    str(tmp_path))
     assert r.code == 0, r
-    fetched = sorted(map(int, r.startswith("RENDERED")[0].split("fetched:")[1].split()))
+    fetched = sorted(set(map(int, r.startswith("RENDERED")[0].split("fetched:")[1].split())))
     assert fetched == [1000, 1001, 1002]
     img = ofxhost.read_raw(out, W, H)
     n = clip["noisy"]
-    ref = core_render([None, None, n[0], n[1], n[2]], 2, r.values("profileData"), temporal_radius=2)
-    np.testing.assert_array_equal(img[..., :3], ref[..., :3])
+    ref = core_render([None, None, n[0], n[1], n[2]], 2, box_profile(clip, 0), temporal_radius=2)
+    np.testing.assert_allclose(img[..., :3], ref[..., :3], atol=ROUNDING)
 
 
 def test_identity(clip, tmp_path):
@@ -188,15 +217,15 @@ def test_mix_noise_output_and_mask(clip, tmp_path):
     np.testing.assert_allclose(inv[:, W // 2:], full[:, W // 2:], atol=1e-6)
 
 
-def test_colourspace_change_after_analysis(clip, tmp_path):
-    """A profile measured in the other working space is not used: the status
-    says so and the render falls back to Auto."""
-    a, b = render_path(clip, "cs_stored.raw"), render_path(clip, "cs_auto.raw")
+def test_colourspace_change_remeasures(clip, tmp_path):
+    """Changing Input Colourspace after analysing needs no re-analysis: the
+    box is measured again in the new working space."""
+    out = render_path(clip, "cs.raw")
     r = ofxhost.run(base(clip, analysed(clip) + ["set temporalRadius 0", "set inputColourspace 1",
-                                                  "get profileStatus", "render 1002 %s" % a,
-                                                  "set profileMode 2", "render 1002 %s" % b]), str(tmp_path))
-    assert "re-analyse" in r.values("profileStatus")
-    np.testing.assert_array_equal(ofxhost.read_raw(a, W, H), ofxhost.read_raw(b, W, H))
+                                                  "render 1002 %s" % out]), str(tmp_path))
+    assert r.code == 0, r
+    ref = core_render([clip["noisy"][2]], 0, box_profile(clip, 2, space=sdcore.VIDEO), space=sdcore.VIDEO)
+    np.testing.assert_allclose(ofxhost.read_raw(out, W, H)[..., :3], ref[..., :3], atol=ROUNDING)
 
 
 def test_region_every_frame_matches_analysed(clip, tmp_path):
@@ -205,18 +234,20 @@ def test_region_every_frame_matches_analysed(clip, tmp_path):
                                                   "set profileMode 1", "get profileStatus",
                                                   "render 1002 %s" % b]), str(tmp_path))
     assert r.values("profileStatus").startswith("Region: the box")
-    # same measurement; the analysed one was stored as text (6 digits)
-    np.testing.assert_allclose(ofxhost.read_raw(a, W, H), ofxhost.read_raw(b, W, H), atol=1e-4)
+    np.testing.assert_array_equal(ofxhost.read_raw(a, W, H), ofxhost.read_raw(b, W, H))
 
 
 def test_half_render_scale(clip, tmp_path):
+    """At half render scale the box is measured on the half-size image the
+    host supplies, so the profile matches what is being denoised."""
     out = render_path(clip, "half_scale.raw")
-    r = ofxhost.run(base(clip, analysed(clip) + ["set temporalRadius 1", "get profileData",
-                                                  "render 1002 %s 0.5" % out]), str(tmp_path))
+    r = ofxhost.run(base(clip, analysed(clip) + ["set temporalRadius 1", "render 1002 %s 0.5" % out]),
+                    str(tmp_path))
     assert r.code == 0, r
     img = ofxhost.read_raw(out, W // 2, H // 2)
     n = [f.reshape(H // 2, 2, W // 2, 2, 3).mean((1, 3)) for f in clip["noisy"][1:4]]
     c = clip["clean"][2].reshape(H // 2, 2, W // 2, 2, 3).mean((1, 3))
-    ref = core_render(n, 1, r.values("profileData"), temporal_radius=1, scale_shift=1)
+    ref = core_render(n, 1, box_profile(clip, 2, scale=2), temporal_radius=1)
+    # (the host averages the half-size image in float32, numpy in float64)
     np.testing.assert_allclose(img[..., :3], ref[..., :3], atol=1e-5)
     assert synth.psnr(c, img) > synth.psnr(c, n[1]) + 6

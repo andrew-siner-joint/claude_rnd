@@ -258,7 +258,7 @@ std::string NoiseProfile::serialize() const
     if (!valid) return std::string();
     std::ostringstream os;
     os.imbue(std::locale::classic());
-    os.precision(6);
+    os.precision(9);  // floats round-trip exactly
     os << "SDP1 " << int(space) << ' ' << scales << ' ' << lumaLo << ' ' << lumaHi << ' ' << fromRegion << ' '
        << region.x1 << ' ' << region.y1 << ' ' << region.x2 << ' ' << region.y2 << ' ' << frame << ' ' << imageW << ' '
        << imageH;

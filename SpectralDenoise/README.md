@@ -65,9 +65,12 @@ Batch node bin under JointPost.
 2. In the viewer, drag the yellow **analysis box** onto an area with no
    detail. Bigger is better: 256 × 256 or more catches blotchy, low-frequency
    noise too. Drag a corner to resize, drag inside to move.
-3. Press **Analyse Noise**. The **Status** line shows the measured luma and
-   chroma noise. The profile is saved in the script, so the shot renders the
-   same on the farm.
+3. Press **Analyse Noise**. This sets **Analysis Frame** to the current frame
+   and **Profile** to **Analysed**. From then on, the box is measured on that
+   frame whenever the node renders (once, then cached), whichever frame is
+   being rendered. The script stores only the box and the frame number,
+   ordinary parameters that Nuke scripts and Flame setups both save, so the
+   shot renders the same on the farm and in other hosts.
 4. Set **Output** to **Removed Noise** and check that what's being removed
    looks like noise, with no edges or texture. If you see detail, lower
    **Noise Level** (or Fine / Medium for that size of detail). If noise is
@@ -85,11 +88,12 @@ content.
 
 | Control | What it does |
 |---|---|
-| Profile | **Analysed** (default): the profile from Analyse Noise, saved with the script. **Region (every frame)**: measures the box on every frame while rendering. Use it if your host can't analyse on the button, or when the noise changes over the shot (a gain ramp). **Auto (every frame)**: finds the flattest parts of each frame itself. It's convenient but deliberately cautious with blotchy colour noise. Before you analyse, Analysed mode renders as Auto |
+| Profile | **Analysed**: the box measured on the Analysis Frame (recommended). **Region (every frame)**: measures the box on every frame. Use it when the noise changes over the shot (a gain ramp) and the box stays on a flat area. **Auto (every frame)** (default until you analyse): finds the flattest parts of each frame itself. It's convenient but deliberately cautious with blotchy colour noise |
 | Box Bottom Left / Top Right | The analysis box. Drag it in the viewer |
-| Analyse Noise | Measures the box on the current frame |
-| Status | What was measured, and warnings |
-| Input Colourspace | **Scene Linear**: for linear-light plates. A log-like curve is applied internally so shadow and highlight noise are handled evenly. **Log / Video**: log or display-referred material, processed as is. Re-analyse after changing it |
+| Analyse Noise | Uses the box on the current frame: sets Analysis Frame to this frame and Profile to Analysed. Reads no image itself, so it works in any host |
+| Analysis Frame | The frame the box is measured on in Analysed mode. You can also type it. Moving the box, or changing the frame or Input Colourspace, re-measures on the next render |
+| Status | Which profile mode is in use. If the box is too small (under 24 × 24 pixels) or off the image, Auto is used instead |
+| Input Colourspace | **Scene Linear**: for linear-light plates. A log-like curve is applied internally so shadow and highlight noise are handled evenly. **Log / Video**: log or display-referred material, processed as is |
 | Brightness Adaptive | Follows how noise changes with brightness (measured over the whole frame when you analyse). Off: the box's noise level is used everywhere |
 
 **Reduction**
@@ -144,9 +148,10 @@ A 2048 × 1080 frame on a 4-core cloud machine:
 | Best | 1.3 s | 5.5 s | 9.5 s |
 
 It uses all CPU cores, so a 16-core workstation should be roughly 3 to 4×
-faster. Auto profile mode adds about 0.4 s per frame. In a downscaled viewer
-or proxy mode, the profile is converted for that scale (cached), so previews
-match the full-resolution render.
+faster. Auto profile mode adds about 0.4 s per frame; Analysed mode measures
+the box once and caches it. In a downscaled viewer or proxy mode the box is
+measured on the downscaled image, so previews match the full-resolution
+render.
 
 ## How it works
 
@@ -188,9 +193,10 @@ python3 -m pytest -q        # needs numpy, scipy, pytest, cmake, expat, GL heade
 - `test_ofx.py` loads the **built plugin** into a scriptable OFX host
   (`tests/host`, built on the OpenFX HostSupport reference library). It sets
   parameters, presses Analyse Noise, renders, and checks that the frames
-  requested, mask, mix, Removed Noise output, identity, profile modes,
-  colourspace mismatch and half render scale all behave correctly. It also
-  checks that rendered pixels match the core exactly.
+  requested (including the Analysis Frame), mask, mix, Removed Noise
+  output, identity, profile modes, fallbacks and half render scale all
+  behave correctly. It also checks that rendered pixels match the core bit
+  for bit.
 
 CI (`.github/workflows/spectraldenoise.yml`) runs the tests and builds the
 macOS, Linux and Windows bundles.
@@ -202,11 +208,12 @@ Nuke or Flame themselves. Please check these and report back:
 
 - [ ] Nuke loads the bundle, and the node appears under JointPost.
 - [ ] The analysis box draws in the Nuke viewer and its corners and body drag.
-- [ ] **Analyse Noise** works in Nuke. It reads the source image from the
-      button handler, which the OFX spec allows but not every host
-      implements. If it says it couldn't read the image, use
-      Profile → Region (every frame).
-- [ ] The Status line updates after Analyse.
+- [ ] **Analyse Noise** sets Analysis Frame and Profile → Analysed in Nuke,
+      and the result changes visibly from Auto (compare Output → Removed
+      Noise before and after).
+- [ ] With the Analysis Frame outside the current temporal window, Nuke
+      supplies that frame (it's requested through the OFX frames-needed
+      action).
 - [ ] Temporal Radius fetches neighbouring frames in Nuke and at clip ends.
 - [ ] The mask input works in Nuke.
 - [ ] Proxy / downscaled viewer gives a preview that matches the full render.
@@ -221,8 +228,7 @@ Nuke or Flame themselves. Please check these and report back:
 |---|---|
 | Node not in Nuke's menu | Check the bundle is in `/Library/OFX/Plugins` (macOS) or `/usr/OFX/Plugins` (Linux), or on `OFX_PLUGIN_PATH`. Delete `~/.nuke/ofxplugincache` and restart |
 | macOS says the plugin is damaged or can't be checked | It's quarantined after download: `sudo xattr -dr com.apple.quarantine /Library/OFX/Plugins/SpectralDenoise.ofx.bundle` (install.sh does this) |
-| "Could not read the source image" on Analyse | The host doesn't allow it on a button. Use Profile → Region (every frame) |
-| Status says the profile was measured with the other colourspace | You changed Input Colourspace after analysing. Analyse again |
+| Analysed looks the same as Auto | The box is probably smaller than 24 × 24 pixels or off the image, so Auto is used. Make it bigger and check it's over the plate on the Analysis Frame |
 | Detail is being removed | Look at Output → Removed Noise. Lower Noise Level, or the Fine / Medium level for that size of detail. Make sure the box had no detail in it |
 | Blotchy colour noise left | Use a bigger analysis box (it measures the coarse levels), raise Chroma Level or Coarse / Very Coarse, or add temporal radius |
 | Ghosting on fast motion | Lower Motion Tolerance, or Temporal Radius |

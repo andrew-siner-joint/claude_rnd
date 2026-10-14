@@ -1,8 +1,9 @@
 // SpectralDenoise: OFX image effect around the core in src/core.
 //
 // Parameters, clips and the region overlay live here; all image maths is in
-// the core. The noise profile is stored in a hidden string parameter, so it
-// is saved with the script and renders the same everywhere.
+// the core. The noise profile is never stored: the script keeps only the
+// box and the Analysis Frame (ordinary parameters every host saves), and the
+// box is measured on that frame while rendering, then cached.
 #ifdef _WIN32
 #ifndef NOMINMAX
 #define NOMINMAX
@@ -40,7 +41,8 @@
 #define kPluginDescription                                                                                            \
     "Profile-based noise reduction.\n\n"                                                                              \
     "Draw the analysis box over an area with no detail (sky, a wall, a grey card), press Analyse Noise, and the "     \
-    "noise in that area is measured: its strength at every spatial frequency, for luma and chroma, at four scales, " \
+    "noise in that area on that frame is measured: its strength at every spatial frequency, for luma and chroma, "   \
+    "at four scales, "                                                                                                 \
     "plus how it changes with brightness. Only that noise is then removed, so detail that doesn't look like it is "  \
     "kept. Temporal Radius adds neighbouring frames, matched for motion, for much stronger reduction."
 
@@ -52,7 +54,7 @@
 #define kParamRegionTR "analysisTopRight"
 #define kParamAnalyse "analyseNoise"
 #define kParamStatus "profileStatus"
-#define kParamProfileData "profileData"
+#define kParamAnalysisFrame "analysisFrame"
 #define kParamColourspace "inputColourspace"
 #define kParamLumaAdaptive "brightnessAdaptive"
 // Reduction
@@ -135,9 +137,8 @@ private:
     sd::Settings settingsAt(double time) const;
     // Region parameters in pixel coordinates of an image window at a scale.
     sd::RectI regionPixels(double time, const OfxPointD& renderScale, const OfxRectI& win) const;
-    // The analysed profile, converted for a render scale of 1 / 2^shift.
-    bool storedProfile(sd::NoiseProfile& out, int shift = 0);
-    void analyse(double time, const OfxPointD& renderScale);
+    // The box measured on the Analysis Frame, at a render scale (cached).
+    bool analysedProfile(double time, const OfxPointD& renderScale, sd::Space space, sd::NoiseProfile& out);
     void updateStatus();
     int temporalRadiusAt(double time) const;
 
@@ -149,7 +150,7 @@ private:
     OFX::Double2DParam* regionBL_;
     OFX::Double2DParam* regionTR_;
     OFX::StringParam* status_;
-    OFX::StringParam* profileData_;
+    OFX::IntParam* analysisFrame_;
     OFX::ChoiceParam* colourspace_;
     OFX::BooleanParam* lumaAdaptive_;
     OFX::DoubleParam* level_;
@@ -166,10 +167,10 @@ private:
     OFX::DoubleParam* mix_;
     OFX::BooleanParam* maskInvert_ = nullptr;
 
+    // Analysed profiles by (frame, box, colourspace, render scale): a few
+    // entries, so viewer and full-res renders don't evict each other.
     std::mutex cacheMutex_;
-    std::string cachedText_;
-    sd::NoiseProfile cachedProfile_[4];  // per render-scale shift
-    bool cachedShift_[4] = {false, false, false, false};
+    std::vector<std::pair<std::string, sd::NoiseProfile>> cache_;
 };
 
 SpectralDenoisePlugin::SpectralDenoisePlugin(OfxImageEffectHandle handle) : ImageEffect(handle)
@@ -184,7 +185,7 @@ SpectralDenoisePlugin::SpectralDenoisePlugin(OfxImageEffectHandle handle) : Imag
     regionBL_ = fetchDouble2DParam(kParamRegionBL);
     regionTR_ = fetchDouble2DParam(kParamRegionTR);
     status_ = fetchStringParam(kParamStatus);
-    profileData_ = fetchStringParam(kParamProfileData);
+    analysisFrame_ = fetchIntParam(kParamAnalysisFrame);
     colourspace_ = fetchChoiceParam(kParamColourspace);
     lumaAdaptive_ = fetchBooleanParam(kParamLumaAdaptive);
     level_ = fetchDoubleParam(kParamLevel);
@@ -248,120 +249,76 @@ sd::RectI SpectralDenoisePlugin::regionPixels(double time, const OfxPointD& rs, 
     return r;
 }
 
-bool SpectralDenoisePlugin::storedProfile(sd::NoiseProfile& out, int shift)
+bool SpectralDenoisePlugin::analysedProfile(double time, const OfxPointD& renderScale, sd::Space space,
+                                            sd::NoiseProfile& out)
 {
-    shift = std::max(0, std::min(shift, 3));
-    std::string text;
-    profileData_->getValue(text);
+    int frame = 0;
+    analysisFrame_->getValueAtTime(time, frame);
+    double x1, y1, x2, y2;
+    regionBL_->getValueAtTime(frame, x1, y1);
+    regionTR_->getValueAtTime(frame, x2, y2);
+    char key[256];
+    std::snprintf(key, sizeof key, "%d %.3f %.3f %.3f %.3f %d %.4f %.4f", frame, x1, y1, x2, y2, int(space),
+                  renderScale.x, renderScale.y);
+    {
+        std::lock_guard<std::mutex> lock(cacheMutex_);
+        for (auto& e : cache_)
+            if (e.first == key) {
+                out = e.second;
+                return out.valid;
+            }
+    }
+    // Measure at the render scale: the host's downscale changes the noise,
+    // so measuring what this render actually sees is the most accurate.
+    std::unique_ptr<OFX::Image> img(src_->fetchImage(frame));
+    if (!img || img->getPixelDepth() != OFX::eBitDepthFloat) return false;
+    const OfxRectI win = img->getBounds();
+    std::vector<float> buf;
+    copyImage(*img, win, 4, buf);
+    sd::ImageView v;
+    v.data = buf.data();
+    v.w = win.x2 - win.x1;
+    v.h = win.y2 - win.y1;
+    v.comps = 4;
+    v.rowStride = std::ptrdiff_t(v.w) * 4;
+    sd::Frame f;
+    sd::toWorking(v, space, f);
+    out = sd::analyseRegion(f, regionPixels(frame, renderScale, win), space, 0);
+    out.frame = frame;
     std::lock_guard<std::mutex> lock(cacheMutex_);
-    if (text != cachedText_) {
-        cachedText_ = text;
-        cachedProfile_[0].parse(text);
-        for (int i = 1; i < 4; ++i) cachedShift_[i] = false;
-    }
-    if (shift > 0 && !cachedShift_[shift]) {
-        cachedProfile_[shift] = sd::profileAtScale(cachedProfile_[0], shift);
-        cachedShift_[shift] = true;
-    }
-    out = cachedProfile_[shift];
+    cache_.emplace_back(key, out);
+    if (cache_.size() > 6) cache_.erase(cache_.begin());
     return out.valid;
 }
 
 void SpectralDenoisePlugin::updateStatus()
 {
-    int mode = 0;
+    int mode = 0, frame = 0;
     profileMode_->getValue(mode);
+    analysisFrame_->getValue(frame);
     std::string s;
-    if (mode == eProfileAuto) {
-        s = "Auto: the noise is measured on every frame.";
-    } else if (mode == eProfileRegionLive) {
+    if (mode == eProfileAuto)
+        s = "Auto: the noise is measured on every frame. For a better result, put the box on a flat area and press "
+            "Analyse Noise.";
+    else if (mode == eProfileRegionLive)
         s = "Region: the box is measured on every frame.";
-    } else {
-        sd::NoiseProfile p;
-        if (!storedProfile(p)) {
-            s = "No profile yet (using Auto). Put the box on a flat area and press Analyse Noise.";
-        } else {
-            int cs = 0;
-            colourspace_->getValue(cs);
-            s = p.summary();
-            if ((cs == 1) != (p.space == sd::Space::Video))
-                s += "  [Measured with the other Input Colourspace: using Auto until you re-analyse.]";
-        }
-    }
+    else
+        s = "Analysed: the box on frame " + std::to_string(frame) +
+            ". If the box is too small or off the image, Auto is used instead.";
     status_->setValue(s);
-}
-
-void SpectralDenoisePlugin::analyse(double time, const OfxPointD& renderScale)
-{
-    if (!src_ || !src_->isConnected()) {
-        sendMessage(OFX::Message::eMessageError, "", "Connect a source before analysing.");
-        return;
-    }
-    const OfxRangeD range = src_->getFrameRange();
-    if (time < range.min || time > range.max) {
-        sendMessage(OFX::Message::eMessageError, "", "There is no source frame at this time: move to a frame of the clip.");
-        return;
-    }
-    std::unique_ptr<OFX::Image> img;
-    try {
-        img.reset(src_->fetchImage(time));
-    } catch (...) {
-        img.reset();
-    }
-    if (!img) {
-        sendMessage(OFX::Message::eMessageError, "",
-                    "Could not read the source image here. Set Profile to 'Region (every frame)' instead: it "
-                    "measures the box while rendering.");
-        return;
-    }
-    if (img->getPixelDepth() != OFX::eBitDepthFloat) {
-        sendMessage(OFX::Message::eMessageError, "", "Unsupported bit depth.");
-        return;
-    }
-    const OfxRectI win = img->getBounds();
-    const int comps = 4;
-    std::vector<float> buf;
-    copyImage(*img, win, comps, buf);
-    int cs = 0;
-    colourspace_->getValueAtTime(time, cs);
-    const sd::Space space = cs == 1 ? sd::Space::Video : sd::Space::SceneLinear;
-    sd::ImageView v;
-    v.data = buf.data();
-    v.w = win.x2 - win.x1;
-    v.h = win.y2 - win.y1;
-    v.comps = comps;
-    v.rowStride = std::ptrdiff_t(v.w) * comps;
-    sd::Frame f;
-    sd::toWorking(v, space, f);
-    // Profiles are always stored at full resolution: undo the render scale.
-    std::string err;
-    sd::NoiseProfile p;
-    const sd::RectI rect = regionPixels(time, renderScale, win);
-    if (renderScale.x < 0.99 || renderScale.y < 0.99) {
-        sendMessage(OFX::Message::eMessageWarning, "",
-                    "The viewer is at a reduced resolution (proxy or downscale). Analyse at full resolution for an "
-                    "accurate profile.");
-    }
-    p = sd::analyseRegion(f, rect, space, 0, &err);
-    if (!p.valid) {
-        sendMessage(OFX::Message::eMessageError, "", err.empty() ? "Analysis failed." : err);
-        return;
-    }
-    p.frame = time;
-    beginEditBlock("Analyse Noise");
-    profileData_->setValue(p.serialize());
-    int mode = 0;
-    profileMode_->getValue(mode);
-    if (mode != eProfileStored) profileMode_->setValue(int(eProfileStored));
-    updateStatus();
-    endEditBlock();
 }
 
 void SpectralDenoisePlugin::changedParam(const OFX::InstanceChangedArgs& args, const std::string& name)
 {
     if (name == kParamAnalyse) {
-        analyse(args.time, args.renderScale);
-    } else if (name == kParamProfileMode || name == kParamColourspace || name == kParamProfileData) {
+        // No image is read here (not every host allows it outside a render):
+        // record the frame; the box is measured on it when rendering.
+        beginEditBlock("Analyse Noise");
+        analysisFrame_->setValue(int(std::lround(args.time)));
+        profileMode_->setValue(int(eProfileStored));
+        updateStatus();
+        endEditBlock();
+    } else if (name == kParamProfileMode || name == kParamAnalysisFrame) {
         updateStatus();
     }
 }
@@ -390,6 +347,17 @@ void SpectralDenoisePlugin::getFramesNeeded(const OFX::FramesNeededArguments& ar
     range.min = args.time - r;
     range.max = args.time + r;
     frames.setFramesNeeded(*src_, range);
+    int mode = 0;
+    profileMode_->getValueAtTime(args.time, mode);
+    if (mode == eProfileStored) {
+        int f = 0;
+        analysisFrame_->getValueAtTime(args.time, f);
+        if (f < range.min || f > range.max) {
+            OfxRangeD a;
+            a.min = a.max = f;
+            frames.setFramesNeeded(*src_, a);
+        }
+    }
 }
 
 void SpectralDenoisePlugin::getRegionsOfInterest(const OFX::RegionsOfInterestArguments& args,
@@ -480,11 +448,7 @@ void SpectralDenoisePlugin::render(const OFX::RenderArguments& args)
     int mode = 0;
     profileMode_->getValueAtTime(args.time, mode);
     sd::NoiseProfile profile;
-    const double rs = std::min(args.renderScale.x, args.renderScale.y);
-    // A profile measured at full resolution, used at a reduced render scale
-    // (proxy, downscaled viewer): converted for that scale.
-    const int scaleShift = rs > 0.0 && rs < 0.99 ? std::max(0, std::min(3, int(std::lround(std::log2(1.0 / rs))))) : 0;
-    if (mode == eProfileStored && storedProfile(profile, scaleShift) && profile.space == st.space) {
+    if (mode == eProfileStored && analysedProfile(args.time, args.renderScale, st.space, profile)) {
     } else if (mode == eProfileRegionLive) {
         std::string err;
         profile = sd::analyseRegion(frames[size_t(radius)], regionPixels(args.time, args.renderScale, win), st.space,
@@ -802,13 +766,13 @@ void SpectralDenoiseFactory::describeInContext(OFX::ImageEffectDescriptor& desc,
     {
         OFX::ChoiceParamDescriptor* p = desc.defineChoiceParam(kParamProfileMode);
         p->setLabels("Profile", "Profile", "Profile");
-        p->setHint("Analysed: the profile measured by Analyse Noise, saved with the script (recommended).\n"
+        p->setHint("Analysed: the box measured on the Analysis Frame (recommended; set by Analyse Noise).\n"
                    "Region (every frame): measure the box on every frame while rendering.\n"
                    "Auto (every frame): measure the flattest parts of every frame.");
         p->appendOption("Analysed");
         p->appendOption("Region (every frame)");
         p->appendOption("Auto (every frame)");
-        p->setDefault(eProfileStored);
+        p->setDefault(eProfileAuto);
         p->setAnimates(false);
         p->setParent(*gProfile);
         page->addChild(*p);
@@ -838,8 +802,21 @@ void SpectralDenoiseFactory::describeInContext(OFX::ImageEffectDescriptor& desc,
     {
         OFX::PushButtonParamDescriptor* p = desc.definePushButtonParam(kParamAnalyse);
         p->setLabels("Analyse Noise", "Analyse Noise", "Analyse Noise");
-        p->setHint("Measure the noise inside the box on the current frame. The box should hold no detail: sky, "
-                   "a wall, a grey card, out-of-focus background. Bigger is better (256 x 256 or more).");
+        p->setHint("Use the box on the current frame as the noise profile: sets Analysis Frame to this frame and "
+                   "Profile to Analysed. The box should hold no detail: sky, a wall, a grey card, out-of-focus "
+                   "background. Bigger is better (256 x 256 or more).");
+        p->setParent(*gProfile);
+        page->addChild(*p);
+    }
+    {
+        OFX::IntParamDescriptor* p = desc.defineIntParam(kParamAnalysisFrame);
+        p->setLabels("Analysis Frame", "Analysis Frame", "Analysis Frame");
+        p->setHint("The frame the box is measured on in Analysed mode (Analyse Noise sets it). The measurement is "
+                   "made when rendering and cached, so the script stores only this frame number and the box.");
+        p->setDefault(0);
+        p->setRange(-10000000, 10000000);
+        p->setDisplayRange(0, 2000);
+        p->setAnimates(false);
         p->setParent(*gProfile);
         page->addChild(*p);
     }
@@ -847,28 +824,19 @@ void SpectralDenoiseFactory::describeInContext(OFX::ImageEffectDescriptor& desc,
         OFX::StringParamDescriptor* p = desc.defineStringParam(kParamStatus);
         p->setLabels("Status", "Status", "Status");
         p->setStringType(OFX::eStringTypeLabel);
-        p->setDefault("No profile yet (using Auto). Put the box on a flat area and press Analyse Noise.");
+        p->setDefault("Auto: the noise is measured on every frame. For a better result, put the box on a flat area and "
+                      "press Analyse Noise.");
         p->setAnimates(false);
         p->setEvaluateOnChange(false);
         p->setParent(*gProfile);
         page->addChild(*p);
     }
     {
-        OFX::StringParamDescriptor* p = desc.defineStringParam(kParamProfileData);
-        p->setLabels("Profile Data", "Profile Data", "Profile Data");
-        p->setStringType(OFX::eStringTypeSingleLine);
-        p->setIsSecret(true);
-        p->setAnimates(false);
-        p->setDefault("");
-        p->setParent(*gProfile);
-    }
-    {
         OFX::ChoiceParamDescriptor* p = desc.defineChoiceParam(kParamColourspace);
         p->setLabels("Input Colourspace", "Input Colourspace", "Input Colourspace");
         p->setHint("Scene Linear: linear-light footage (Nuke's default working space). A log-like curve is applied "
                    "internally, so shadows and highlights are treated evenly.\n"
-                   "Log / Video: log-encoded or display-referred footage, processed as is.\n"
-                   "Re-analyse after changing this.");
+                   "Log / Video: log-encoded or display-referred footage, processed as is.");
         p->appendOption("Scene Linear");
         p->appendOption("Log / Video");
         p->setDefault(0);
