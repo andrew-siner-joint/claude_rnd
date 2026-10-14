@@ -105,9 +105,14 @@ struct Settings {
     int quality = 1;  // 0 fast, 1 normal, 2 best
     bool lumaAdaptive = true;
     int threads = 0;  // 0 = hardware concurrency
+    bool useGpu = true;  // OpenCL when a GPU is available, else (or on any GPU error) the CPU
 };
 
 using AbortFn = std::function<bool()>;
+
+// Whether an OpenCL GPU is available (initialising it on first call), with
+// the device name, or the reason there is none.
+bool gpuInfo(std::string* deviceOrReason);
 
 // Colour conversion. toWorking reads RGB from the view.
 void toWorking(const ImageView& src, Space space, Frame& out);

@@ -15,6 +15,7 @@
 // Levels are then recombined: each level keeps its own band (itself minus
 // its blurred self) and takes everything coarser from the level below.
 #include "internal.h"
+#include "gpu.h"
 
 #include <cstdint>
 #include <cstring>
@@ -25,46 +26,13 @@ using namespace detail;
 
 namespace {
 
-constexpr float kHardThreshold = 2.7f;
-constexpr int kMaxSlots = 2 * kMaxTemporalRadius + 1;
 // A neighbouring frame with fewer matched blocks than this is not used.
 constexpr double kMinMatchedFraction = 0.3;
-
-struct Motion {
-    int16_t dx = 0, dy = 0;
-    bool ok = false;
-};
-
-struct MotionField {
-    std::vector<int> xs, ys;
-    int step = 1;
-    int slots = 0;  // frames.size()
-    std::vector<Motion> m;
-    Motion& at(size_t bx, size_t by, int slot) { return m[(by * xs.size() + bx) * size_t(slots) + size_t(slot)]; }
-    const Motion& at(size_t bx, size_t by, int slot) const
-    {
-        return m[(by * xs.size() + bx) * size_t(slots) + size_t(slot)];
-    }
-};
-
-struct LevelParams {
-    float sigma[3][kCoefs];  // noise std used for filtering (user multipliers in)
-    float matchVar;          // luma pixel noise variance, for match rejection
-    float matchDcSigma;      // luma DC coefficient noise std, for match rejection
-    const NoiseProfile* prof;
-    bool lumaAdaptive;
-    int step;
-    int quality;
-    float tolerance;
-};
 
 inline void loadBlock(const Plane& p, int x, int y, float* out)
 {
     for (int j = 0; j < kBlock; ++j) std::memcpy(out + j * kBlock, p.row(y + j) + x, sizeof(float) * kBlock);
 }
-
-// Motion vectors are in quarter pixels.
-constexpr int kSub = 4;
 
 inline int floorDiv(int a, int b) { return a >= 0 ? a / b : -((-a + b - 1) / b); }
 
@@ -225,10 +193,6 @@ void estimateMotion(const std::vector<const Frame*>& fr, int ref, const LevelPar
                 } else {
                     for (int dy = -coarsestRadius; dy <= coarsestRadius; ++dy)
                         for (int dx = -coarsestRadius; dx <= coarsestRadius; ++dx) tryVec(dx * kSub, dy * kSub);
-                }
-                if (bx > 0) {
-                    const Motion& l = mf.at(bx - 1, by, s);
-                    tryVec(l.dx, l.dy);
                 }
                 // local refinement: whole pixels, then half, then quarter
                 for (int stepQ = kSub; stepQ >= 1; stepQ /= 2) {
@@ -457,6 +421,8 @@ void resolve(const Accum& acc, Frame& out)
 
 }  // namespace
 
+bool gpuInfo(std::string* deviceOrReason) { return gpuAvailable(deviceOrReason); }
+
 bool denoise(const std::vector<const Frame*>& framesIn, int ref, const NoiseProfile& profile, const Settings& st,
              Frame& out, const AbortFn& abort)
 {
@@ -497,6 +463,7 @@ bool denoise(const std::vector<const Frame*>& framesIn, int ref, const NoiseProf
 
     std::vector<Frame> denoised(static_cast<size_t>(levels));
     std::vector<bool> dropped(static_cast<size_t>(nf), false);
+    bool useGpu = st.useGpu && gpuAvailable(nullptr);
     MotionField coarser;
     bool haveCoarser = false;
     for (int s = levels - 1; s >= 0; --s) {
@@ -528,6 +495,20 @@ bool denoise(const std::vector<const Frame*>& framesIn, int ref, const NoiseProf
         mf.xs = blockGrid(r.w(), step);
         mf.ys = blockGrid(r.h(), step);
         mf.step = step;
+        if (useGpu) {
+            if (gpuLevel(fr, refIdx, lp, haveCoarser ? &coarser : nullptr, dropped, kMinMatchedFraction, twoPass, mf,
+                         denoised[size_t(s)], abort)) {
+                coarser = std::move(mf);
+                haveCoarser = true;
+                continue;
+            }
+            if (abort && abort()) return false;
+            useGpu = false;  // the CPU does this level and the rest
+            mf = MotionField();
+            mf.xs = blockGrid(r.w(), step);
+            mf.ys = blockGrid(r.h(), step);
+            mf.step = step;
+        }
         if (nf > 1) {
             estimateMotion(fr, refIdx, lp, haveCoarser ? &coarser : nullptr, mf, threads);
             // Shot cuts and flashes: a neighbour that hardly matches anywhere

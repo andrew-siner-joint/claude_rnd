@@ -73,6 +73,8 @@
 #define kParamMotionTolerance "motionTolerance"
 // Output
 #define kParamQuality "quality"
+#define kParamUseGpu "useGpu"
+#define kParamGpuStatus "gpuStatus"
 #define kParamOutput "outputMode"
 #define kParamMix "mix"
 #define kParamMaskInvert "maskInvert"
@@ -163,6 +165,7 @@ private:
     OFX::IntParam* temporalRadius_;
     OFX::DoubleParam* motionTolerance_;
     OFX::ChoiceParam* quality_;
+    OFX::BooleanParam* useGpu_;
     OFX::ChoiceParam* output_;
     OFX::DoubleParam* mix_;
     OFX::BooleanParam* maskInvert_ = nullptr;
@@ -201,6 +204,16 @@ SpectralDenoisePlugin::SpectralDenoisePlugin(OfxImageEffectHandle handle) : Imag
     temporalRadius_ = fetchIntParam(kParamTemporalRadius);
     motionTolerance_ = fetchDoubleParam(kParamMotionTolerance);
     quality_ = fetchChoiceParam(kParamQuality);
+    useGpu_ = fetchBooleanParam(kParamUseGpu);
+    // Show which GPU will be used (initialises OpenCL once per session).
+    // Setting a value while the instance is created is allowed by the OFX
+    // spec; if a host refuses, the label just keeps its default.
+    try {
+        std::string dev;
+        const bool ok = sd::gpuInfo(&dev);
+        fetchStringParam(kParamGpuStatus)->setValue(ok ? "GPU: " + dev : "GPU: not available (" + dev + "), using the CPU");
+    } catch (...) {
+    }
     output_ = fetchChoiceParam(kParamOutput);
     mix_ = fetchDoubleParam(kParamMix);
 }
@@ -229,6 +242,9 @@ sd::Settings SpectralDenoisePlugin::settingsAt(double t) const
     s.motionTolerance = float(std::max(0.0, motionTolerance_->getValueAtTime(t)));
     quality_->getValueAtTime(t, q);
     s.quality = q;
+    bool gpu = true;
+    useGpu_->getValueAtTime(t, gpu);
+    s.useGpu = gpu;
     bool la = true;
     lumaAdaptive_->getValueAtTime(t, la);
     s.lumaAdaptive = la;
@@ -917,6 +933,29 @@ void SpectralDenoiseFactory::describeInContext(OFX::ImageEffectDescriptor& desc,
         p->appendOption("Best");
         p->setDefault(1);
         p->setAnimates(false);
+        p->setParent(*gOut);
+        page->addChild(*p);
+    }
+    {
+        OFX::BooleanParamDescriptor* p = desc.defineBooleanParam(kParamUseGpu);
+        p->setLabels("Use GPU", "Use GPU", "Use GPU");
+        p->setHint("Denoise on the GPU (OpenCL: NVIDIA, Apple Silicon, AMD) when there is one. The result is the "
+                   "same as on the CPU. If the GPU fails, the CPU takes over for that frame. Turn off if the GPU is "
+                   "busy with other work or causes problems. Setting the environment variable SD_OPENCL=off "
+                   "disables the GPU for every node.");
+        p->setDefault(true);
+        p->setAnimates(false);
+        p->setParent(*gOut);
+        page->addChild(*p);
+    }
+    {
+        OFX::StringParamDescriptor* p = desc.defineStringParam(kParamGpuStatus);
+        p->setLabels("GPU", "GPU", "GPU");
+        p->setStringType(OFX::eStringTypeLabel);
+        p->setDefault("");
+        p->setAnimates(false);
+        p->setEvaluateOnChange(false);
+        p->setIsPersistant(false);
         p->setParent(*gOut);
         page->addChild(*p);
     }

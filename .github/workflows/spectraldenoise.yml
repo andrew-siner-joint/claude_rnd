@@ -21,7 +21,7 @@ jobs:
       - name: Dependencies
         run: |
           sudo apt-get update -q
-          sudo apt-get install -y -q libgl-dev libexpat1-dev
+          sudo apt-get install -y -q libgl-dev libexpat1-dev opencl-headers pocl-opencl-icd
           python3 -m pip install --break-system-packages numpy scipy pytest
       - name: Tests (core and plugin through the OFX test host)
         working-directory: SpectralDenoise/tests
@@ -43,10 +43,12 @@ jobs:
           cmake -S SpectralDenoise -B build -DCMAKE_BUILD_TYPE=Release
           cmake --build build -j
           ldd build/SpectralDenoise.ofx.bundle/Contents/Linux-x86-64/SpectralDenoise.ofx
+      - name: Package (keeps the SpectralDenoise.ofx.bundle folder)
+        run: tar czf SpectralDenoise-linux.tar.gz -C build SpectralDenoise.ofx.bundle
       - uses: actions/upload-artifact@v4
         with:
           name: SpectralDenoise-linux
-          path: build/SpectralDenoise.ofx.bundle
+          path: SpectralDenoise-linux.tar.gz
 
   macos:
     runs-on: macos-14
@@ -71,7 +73,9 @@ jobs:
         run: |
           cmake -S SpectralDenoise -B build -A x64
           cmake --build build --config Release -j
+      - name: Package (keeps the SpectralDenoise.ofx.bundle folder)
+        run: Compress-Archive -Path build/SpectralDenoise.ofx.bundle -DestinationPath SpectralDenoise-windows.zip
       - uses: actions/upload-artifact@v4
         with:
           name: SpectralDenoise-windows
-          path: build/SpectralDenoise.ofx.bundle
+          path: SpectralDenoise-windows.zip

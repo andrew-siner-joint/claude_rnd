@@ -29,6 +29,7 @@ class SdSettings(ctypes.Structure):
         ("quality", ctypes.c_int),
         ("lumaAdaptive", ctypes.c_int),
         ("threads", ctypes.c_int),
+        ("useGpu", ctypes.c_int),
     ]
 
 
@@ -74,6 +75,13 @@ def analyse(img, region=None, space=LINEAR):
     return buf.value.decode()
 
 
+def gpu_info():
+    """(available, device name or reason)."""
+    buf = ctypes.create_string_buffer(512)
+    ok = lib().sd_gpu_info(buf, len(buf))
+    return bool(ok), buf.value.decode()
+
+
 def summary(profile):
     buf = ctypes.create_string_buffer(512)
     lib().sd_summary(profile.encode(), buf, len(buf))
@@ -110,6 +118,7 @@ def settings(**kw):
     s.quality = kw.get("quality", 1)
     s.lumaAdaptive = int(kw.get("luma_adaptive", True))
     s.threads = kw.get("threads", 0)
+    s.useGpu = int(kw.get("use_gpu", False))
     return s
 
 

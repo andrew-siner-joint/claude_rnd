@@ -31,8 +31,11 @@ def clip(tmp_path_factory):
                 pattern=os.path.join(str(d), "src.%d.raw"))
 
 
-def base(clip, extra=()):
-    return ["clip Source %d %d %d %d %s" % (W, H, FIRST, LAST, clip["pattern"]), "create"] + list(extra)
+def base(clip, extra=(), gpu=False):
+    """Bit-exact comparisons with the core run on the CPU; the GPU tests at
+    the end compare the two paths."""
+    return (["clip Source %d %d %d %d %s" % (W, H, FIRST, LAST, clip["pattern"]), "create",
+             "set useGpu %d" % int(gpu)] + list(extra))
 
 
 def analysed(clip, t=1002):
@@ -76,7 +79,7 @@ def test_parameters_described(clip, tmp_path):
     params = {l.split()[1]: l for l in r.startswith("PARAM")}
     for name in ["profileMode", "analysisBottomLeft", "analysisTopRight", "analyseNoise", "profileStatus",
                  "analysisFrame", "inputColourspace", "brightnessAdaptive", "noiseLevel", "lumaLevel", "chromaLevel",
-                 "lumaReduction", "chromaReduction", "fineLevel", "mediumLevel", "coarseLevel", "veryCoarseLevel",
+                 "lumaReduction", "chromaReduction", "fineLevel", "mediumLevel", "coarseLevel", "veryCoarseLevel", "useGpu", "gpuStatus",
                  "sharpen", "temporalRadius", "motionTolerance", "quality", "outputMode", "mix", "maskInvert"]:
         assert name in params, name
     # every parameter is an ordinary visible one: nothing hidden for hosts to drop
@@ -251,3 +254,46 @@ def test_half_render_scale(clip, tmp_path):
     # (the host averages the half-size image in float32, numpy in float64)
     np.testing.assert_allclose(img[..., :3], ref[..., :3], atol=1e-5)
     assert synth.psnr(c, img) > synth.psnr(c, n[1]) + 6
+
+
+# --- GPU (OpenCL) ----------------------------------------------------------------
+# CI has no GPU: the tests run the OpenCL code on a CPU OpenCL driver (pocl),
+# enabled with SD_OPENCL=any.
+
+ANY = {"SD_OPENCL": "any"}
+
+
+def opencl_device():
+    os.environ["SD_OPENCL"] = "any"
+    try:
+        ok, name = sdcore.gpu_info()
+    finally:
+        del os.environ["SD_OPENCL"]
+    return name if ok else None
+
+
+needs_opencl = pytest.mark.skipif(opencl_device() is None, reason="no OpenCL device (install pocl)")
+
+
+@needs_opencl
+@pytest.mark.parametrize("radius,quality", [(0, 1), (1, 1), (2, 0), (1, 2)])
+def test_gpu_matches_cpu(clip, tmp_path, radius, quality):
+    a, b = render_path(clip, "gpu_on.raw"), render_path(clip, "gpu_off.raw")
+    common = analysed(clip) + ["set temporalRadius %d" % radius, "set quality %d" % quality]
+    r = ofxhost.run(base(clip, common + ["get gpuStatus", "render 1002 %s" % a,
+                                         "set useGpu 0", "render 1002 %s" % b], gpu=True), str(tmp_path), env=ANY)
+    assert r.code == 0, r
+    assert r.values("gpuStatus") == "GPU: " + opencl_device()
+    gpu, cpu = ofxhost.read_raw(a, W, H), ofxhost.read_raw(b, W, H)
+    assert not np.array_equal(gpu, cpu)  # really ran on the OpenCL device
+    np.testing.assert_allclose(gpu, cpu, atol=2e-5)
+
+
+def test_gpu_unavailable_falls_back_to_cpu(clip, tmp_path):
+    a, b = render_path(clip, "nogpu_on.raw"), render_path(clip, "nogpu_off.raw")
+    r = ofxhost.run(base(clip, analysed(clip) + ["get gpuStatus", "render 1002 %s" % a, "set useGpu 0",
+                                                  "render 1002 %s" % b], gpu=True), str(tmp_path),
+                    env={"SD_OPENCL": "off"})
+    assert r.code == 0, r
+    assert r.values("gpuStatus").startswith("GPU: not available")
+    np.testing.assert_array_equal(ofxhost.read_raw(a, W, H), ofxhost.read_raw(b, W, H))

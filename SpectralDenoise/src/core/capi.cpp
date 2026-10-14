@@ -38,7 +38,16 @@ struct SdSettingsC {
     int quality;
     int lumaAdaptive;
     int threads;
+    int useGpu;
 };
+
+int sd_gpu_info(char* out, int outLen)
+{
+    std::string s;
+    const bool ok = sd::gpuInfo(&s);
+    copyOut(s, out, outLen);
+    return ok ? 1 : 0;
+}
 
 // mode 0 = region (rect = x1 y1 x2 y2), 1 = auto. Returns the length needed
 // (including NUL) or 0 on failure, with the error in out.
@@ -93,6 +102,7 @@ int sd_denoise(const float** frames, int nframes, int ref, int w, int h, int com
     s.quality = sc->quality;
     s.lumaAdaptive = sc->lumaAdaptive != 0;
     s.threads = sc->threads;
+    s.useGpu = sc->useGpu != 0;
 
     std::vector<sd::Frame> wf(static_cast<size_t>(nframes));
     std::vector<const sd::Frame*> ptrs(static_cast<size_t>(nframes), nullptr);

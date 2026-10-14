@@ -60,12 +60,14 @@ class Result:
         return "\n".join(self.lines)
 
 
-def run(script, workdir, context="general"):
-    """script: list of command lines (without the 'load' line)."""
+def run(script, workdir, context="general", env=None):
+    """script: list of command lines (without the 'load' line). env: extra
+    environment variables for the host (e.g. SD_OPENCL)."""
     ensure_built()
     path = os.path.join(workdir, "script.txt")
     with open(path, "w") as f:
         f.write("load %s %s %s\n" % (os.path.join(BUILD), PLUGIN_ID, context))
         f.write("\n".join(script) + "\n")
-    p = subprocess.run([HOST, path], capture_output=True, text=True, timeout=600)
+    full_env = dict(os.environ, **(env or {}))
+    p = subprocess.run([HOST, path], capture_output=True, text=True, timeout=600, env=full_env)
     return Result(p.stdout + p.stderr, p.returncode)

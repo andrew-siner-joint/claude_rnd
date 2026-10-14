@@ -27,7 +27,10 @@ actual noise (right) with no edges or texture in it.*
 **Download:** every push builds the plugin for macOS (Apple Silicon and Intel),
 Linux and Windows. Open the repository's **Actions** tab, then the latest
 **SpectralDenoise** run, and download the artifact for your platform from the
-bottom of the page.
+bottom of the page. Unzip it, then extract the archive inside
+(`SpectralDenoise-linux.tar.gz`, `SpectralDenoise-macos.zip` or
+`SpectralDenoise-windows.zip`) to get the `SpectralDenoise.ofx.bundle`
+folder. Hosts only load the plugin inside that folder.
 
 **Or build it yourself** (macOS or Linux; you need CMake, git and a C++
 compiler: on a Mac, `xcode-select --install` and `brew install cmake`):
@@ -118,6 +121,8 @@ content.
 | Control | What it does |
 |---|---|
 | Quality | Fast: one pass, sparse blocks. Normal: two passes. Best: two passes, denser blocks (about 1.5× Normal's time, about 0.3 dB better) |
+| Use GPU | Run on the GPU (OpenCL) when there is one. Turn it off if the GPU is busy with other work or misbehaves; the CPU gives the same result. The environment variable `SD_OPENCL=off` turns it off for every node, e.g. on a farm |
+| GPU | The GPU found, or why none is used |
 | Output | Denoised, or Removed Noise (source minus result) to check your settings |
 | Mix | Blend with the source |
 | Mask / Invert Mask | In Nuke, the node has a mask input: denoise only inside it |
@@ -139,13 +144,21 @@ the speed.
 
 ## Performance
 
-A 2048 × 1080 frame on a 4-core cloud machine:
+**GPU.** With **Use GPU** on (the default), the denoising runs on the GPU
+through OpenCL: NVIDIA on Linux and Windows, Apple Silicon (and AMD) on
+macOS. The **GPU** line under Output shows which device it found. The GPU
+computes the same result as the CPU; in the tests the two differ by at most
+0.00003. If there's no GPU, or the GPU hits an error, that frame is done on
+the CPU instead. GPU speed hasn't been measured yet (the build machines have
+no GPU); please report what you see.
+
+**CPU.** A 2048 × 1080 frame on a 4-core cloud machine:
 
 | Quality | Spatial | Radius 1 | Radius 2 |
 |---|---|---|---|
-| Fast | 0.45 s | 1.2 s | 2.1 s |
-| Normal | 0.9 s | 2.9 s | 4.5 s |
-| Best | 1.3 s | 5.5 s | 9.5 s |
+| Fast | 0.44 s | 1.2 s | 1.9 s |
+| Normal | 0.63 s | 2.5 s | 4.4 s |
+| Best | 1.1 s | 4.7 s | 8.1 s |
 
 It uses all CPU cores, so a 16-core workstation should be roughly 3 to 4×
 faster. Auto profile mode adds about 0.4 s per frame; Analysed mode measures
@@ -156,7 +169,11 @@ render.
 ## How it works
 
 The work is done in a small C++ core (`src/core`) with no OFX dependency. The
-OFX plugin (`src/ofx/SpectralDenoise.cpp`) is a thin layer over it.
+OFX plugin (`src/ofx/SpectralDenoise.cpp`) is a thin layer over it. The GPU
+path (`src/core/gpu.cpp`, kernels in `src/core/kernels_cl.h`) runs step 4's
+motion search and filtering passes in OpenCL, one work group per block, with
+the same arithmetic as the CPU code. OpenCL is loaded at run time, so the
+plugin needs nothing extra installed.
 
 1. **Working space.** Scene-linear input goes through an asinh curve, which is
    linear in the shadows and logarithmic above. Then an orthonormal opponent
@@ -183,13 +200,16 @@ OFX plugin (`src/ofx/SpectralDenoise.cpp`) is a thin layer over it.
 
 ```sh
 cd tests
-python3 -m pytest -q        # needs numpy, scipy, pytest, cmake, expat, GL headers
+python3 -m pytest -q        # needs numpy, scipy, pytest, cmake, expat, GL and OpenCL headers;
+                            # GPU tests need pocl (apt install pocl-opencl-icd)
 ```
 
 - `test_core.py` tests the maths through a C API (`src/core/capi.cpp`):
   profile accuracy against known noise, noise reduction, edge sharpness,
   every control, temporal gain without ghosting, shot cuts, odd sizes,
   NaN/inf input, and determinism across thread counts.
+- GPU tests run the OpenCL code on pocl (a CPU OpenCL driver) and check it
+  against the CPU path, in the core and through the plugin.
 - `test_ofx.py` loads the **built plugin** into a scriptable OFX host
   (`tests/host`, built on the OpenFX HostSupport reference library). It sets
   parameters, presses Analyse Noise, renders, and checks that the frames
@@ -221,6 +241,9 @@ Nuke or Flame themselves. Please check these and report back:
       Flame's support for overlays and for reading images on a button is
       untested; Region (every frame) is the fallback.
 - [ ] Windows build: compiled in CI, never run.
+- [ ] **GPU:** the GPU line names your NVIDIA card / Apple GPU, renders match
+      Use GPU off, and it is faster. The OpenCL code is tested here on a CPU
+      OpenCL driver only.
 
 ## Troubleshooting
 
@@ -232,4 +255,6 @@ Nuke or Flame themselves. Please check these and report back:
 | Detail is being removed | Look at Output → Removed Noise. Lower Noise Level, or the Fine / Medium level for that size of detail. Make sure the box had no detail in it |
 | Blotchy colour noise left | Use a bigger analysis box (it measures the coarse levels), raise Chroma Level or Coarse / Very Coarse, or add temporal radius |
 | Ghosting on fast motion | Lower Motion Tolerance, or Temporal Radius |
-| Slow | Quality Fast and Temporal Radius 1 while working; Normal or Best for the final render |
+| Slow | Check the GPU line shows your GPU and Use GPU is on. Quality Fast and Temporal Radius 1 while working; Normal or Best for the final render |
+| GPU line says "not available" | No OpenCL driver was found. NVIDIA: the normal NVIDIA driver includes OpenCL. macOS: built in. A farm without GPUs just uses the CPU |
+| Crashes or garbage with Use GPU on | Turn Use GPU off (or set `SD_OPENCL=off`) and send me the GPU line and the terminal output |

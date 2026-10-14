@@ -21,8 +21,8 @@ option(SD_BUILD_TESTS "Build the core library for the Python tests and the OFX t
 
 # --- OpenFX SDK --------------------------------------------------------------
 set(OPENFX_DIR "" CACHE PATH "Path to an OpenFX checkout (downloaded if empty)")
+include(FetchContent)
 if(NOT OPENFX_DIR)
-  include(FetchContent)
   FetchContent_Declare(openfx
     GIT_REPOSITORY https://github.com/AcademySoftwareFoundation/openfx.git
     GIT_TAG adb790bf0043714cae6091d58791e8cdabdd9e12)
@@ -44,8 +44,25 @@ endif()
 add_library(sdcore STATIC
   src/core/common.cpp
   src/core/profile.cpp
-  src/core/denoise.cpp)
+  src/core/denoise.cpp
+  src/core/gpu.cpp)
 target_include_directories(sdcore PUBLIC src/core)
+# OpenCL headers only: the library itself is loaded at run time (gpu.cpp).
+if(NOT APPLE)
+  FetchContent_Declare(opencl_headers
+    GIT_REPOSITORY https://github.com/KhronosGroup/OpenCL-Headers.git
+    GIT_TAG v2025.07.22)
+  FetchContent_GetProperties(opencl_headers)
+  if(NOT opencl_headers_POPULATED)
+    FetchContent_Populate(opencl_headers)
+  endif()
+  target_include_directories(sdcore PRIVATE ${opencl_headers_SOURCE_DIR})
+endif()
+target_link_libraries(sdcore PUBLIC ${CMAKE_DL_LIBS})
+if(APPLE)
+  # OpenCL is deprecated on macOS but still ships, on Apple Silicon too.
+  target_compile_definitions(sdcore PRIVATE CL_SILENCE_DEPRECATION)
+endif()
 find_package(Threads REQUIRED)
 target_link_libraries(sdcore PUBLIC Threads::Threads)
 if(MSVC)

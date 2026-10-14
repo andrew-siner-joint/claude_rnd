@@ -6,11 +6,46 @@
 #include <algorithm>
 #include <atomic>
 #include <cmath>
+#include <cstdint>
 #include <thread>
 #include <vector>
 
 namespace sd {
 namespace detail {
+
+constexpr float kHardThreshold = 2.7f;
+constexpr int kMaxSlots = 2 * kMaxTemporalRadius + 1;
+// Motion vectors are in quarter pixels.
+constexpr int kSub = 4;
+
+struct Motion {
+    int16_t dx = 0, dy = 0;
+    bool ok = false;
+};
+
+// Motion of every block on a level's grid, for every frame slot.
+struct MotionField {
+    std::vector<int> xs, ys;
+    int step = 1;
+    int slots = 0;  // frames.size()
+    std::vector<Motion> m;
+    Motion& at(size_t bx, size_t by, int slot) { return m[(by * xs.size() + bx) * size_t(slots) + size_t(slot)]; }
+    const Motion& at(size_t bx, size_t by, int slot) const
+    {
+        return m[(by * xs.size() + bx) * size_t(slots) + size_t(slot)];
+    }
+};
+
+struct LevelParams {
+    float sigma[3][kCoefs];  // noise std used for filtering (user multipliers in)
+    float matchVar;          // luma pixel noise variance, for match rejection
+    float matchDcSigma;      // luma DC coefficient noise std, for match rejection
+    const NoiseProfile* prof;
+    bool lumaAdaptive;
+    int step;
+    int quality;
+    float tolerance;
+};
 
 // Orthonormal DCT-II matrices.
 struct DctTables {
@@ -22,57 +57,69 @@ struct DctTables {
 };
 const DctTables& tables();
 
-// 2D DCT of an 8x8 block (row-major), in/out may not alias.
-inline void dct8x8(const float* in, float* out)
+// 1D 8-point DCT of the 8 columns of a block at once (out = C * in), using
+// the symmetry c[k][7-n] = (-1)^k c[k][n]: even outputs from sums, odd ones
+// from differences, half the multiplies of a plain matrix product. Rows are
+// processed as 8-wide vectors, which compilers vectorise.
+inline void dctColumns(const float* in, float* out)
 {
     const auto& T = tables().c8;
-    float tmp[kCoefs];
-    // rows: tmp[y][k] = sum_x in[y][x] * C[k][x]
-    for (int y = 0; y < kBlock; ++y) {
-        const float* r = in + y * kBlock;
-        for (int k = 0; k < kBlock; ++k) {
-            float s = 0.0f;
-            for (int x = 0; x < kBlock; ++x) s += r[x] * T[k][x];
-            tmp[y * kBlock + k] = s;
+    float sum[4][kBlock], dif[4][kBlock];
+    for (int n = 0; n < 4; ++n)
+        for (int i = 0; i < kBlock; ++i) {
+            sum[n][i] = in[n * kBlock + i] + in[(7 - n) * kBlock + i];
+            dif[n][i] = in[n * kBlock + i] - in[(7 - n) * kBlock + i];
         }
+    for (int k = 0; k < kBlock; ++k) {
+        const float(*src)[kBlock] = (k & 1) ? dif : sum;
+        float* o = out + k * kBlock;
+        for (int i = 0; i < kBlock; ++i)
+            o[i] = T[k][0] * src[0][i] + T[k][1] * src[1][i] + T[k][2] * src[2][i] + T[k][3] * src[3][i];
     }
-    // columns: out[l][k] = sum_y C[l][y] * tmp[y][k]
-    for (int l = 0; l < kBlock; ++l) {
-        float* o = out + l * kBlock;
-        for (int k = 0; k < kBlock; ++k) o[k] = 0.0f;
-        for (int y = 0; y < kBlock; ++y) {
-            const float c = T[l][y];
-            const float* r = tmp + y * kBlock;
-            for (int k = 0; k < kBlock; ++k) o[k] += c * r[k];
+}
+
+// Inverse of dctColumns (out = C^T * in).
+inline void idctColumns(const float* in, float* out)
+{
+    const auto& T = tables().c8;
+    for (int n = 0; n < 4; ++n) {
+        float even[kBlock], odd[kBlock];
+        for (int i = 0; i < kBlock; ++i) {
+            even[i] = T[0][n] * in[0 * kBlock + i] + T[2][n] * in[2 * kBlock + i] + T[4][n] * in[4 * kBlock + i] +
+                      T[6][n] * in[6 * kBlock + i];
+            odd[i] = T[1][n] * in[1 * kBlock + i] + T[3][n] * in[3 * kBlock + i] + T[5][n] * in[5 * kBlock + i] +
+                     T[7][n] * in[7 * kBlock + i];
+        }
+        for (int i = 0; i < kBlock; ++i) {
+            out[n * kBlock + i] = even[i] + odd[i];
+            out[(7 - n) * kBlock + i] = even[i] - odd[i];
         }
     }
 }
 
+inline void transpose8(const float* in, float* out)
+{
+    for (int y = 0; y < kBlock; ++y)
+        for (int x = 0; x < kBlock; ++x) out[x * kBlock + y] = in[y * kBlock + x];
+}
+
+// 2D DCT of an 8x8 block (row-major): out = C * in * C^T. in/out may not alias.
+inline void dct8x8(const float* in, float* out)
+{
+    float a[kCoefs], b[kCoefs];
+    dctColumns(in, a);  // C * in
+    transpose8(a, b);   // (C * in)^T = in^T * C^T
+    dctColumns(b, a);   // C * in^T * C^T = (C * in * C^T)^T
+    transpose8(a, out);
+}
+
 inline void idct8x8(const float* in, float* out)
 {
-    const auto& T = tables().c8;
-    float tmp[kCoefs];
-    // columns: tmp[y][k] = sum_l C[l][y] * in[l][k]
-    for (int y = 0; y < kBlock; ++y) {
-        float* o = tmp + y * kBlock;
-        for (int k = 0; k < kBlock; ++k) o[k] = 0.0f;
-        for (int l = 0; l < kBlock; ++l) {
-            const float c = T[l][y];
-            const float* r = in + l * kBlock;
-            for (int k = 0; k < kBlock; ++k) o[k] += c * r[k];
-        }
-    }
-    // rows: out[y][x] = sum_k tmp[y][k] * C[k][x]
-    for (int y = 0; y < kBlock; ++y) {
-        const float* r = tmp + y * kBlock;
-        float* o = out + y * kBlock;
-        for (int x = 0; x < kBlock; ++x) o[x] = 0.0f;
-        for (int k = 0; k < kBlock; ++k) {
-            const float v = r[k];
-            const float* c = T[k];
-            for (int x = 0; x < kBlock; ++x) o[x] += v * c[x];
-        }
-    }
+    float a[kCoefs], b[kCoefs];
+    idctColumns(in, a);
+    transpose8(a, b);
+    idctColumns(b, a);
+    transpose8(a, out);
 }
 
 inline int mirror(int i, int n)

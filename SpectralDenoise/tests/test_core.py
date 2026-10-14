@@ -1,5 +1,7 @@
 """Behaviour of the core (src/core) through its C API: profiling accuracy,
 noise reduction, detail, temporal filtering and robustness."""
+import os
+
 import numpy as np
 import pytest
 from scipy.ndimage import gaussian_filter
@@ -337,3 +339,27 @@ def test_deterministic_across_thread_counts(seq):
     a = sdcore.denoise(noisy[1:4], 1, prof, temporal_radius=1, threads=1)
     b = sdcore.denoise(noisy[1:4], 1, prof, temporal_radius=1, threads=7)
     assert np.array_equal(a, b)
+
+
+# --- GPU (OpenCL) --------------------------------------------------------------------
+
+
+def _with_any_opencl():
+    os.environ["SD_OPENCL"] = "any"
+    return sdcore.gpu_info()[0]
+
+
+@pytest.mark.parametrize("radius,quality", [(0, 0), (0, 1), (2, 1), (1, 2)])
+def test_gpu_path_matches_cpu(seq, radius, quality):
+    """The OpenCL path computes the same thing as the CPU path: same motion,
+    same filtering, differences at float rounding only."""
+    if not _with_any_opencl():
+        pytest.skip("no OpenCL device (install pocl)")
+    clean, noisy, rect, box = seq
+    prof = sdcore.analyse(noisy[2], region=rect)
+    frames = noisy[2 - radius:3 + radius]
+    cpu = sdcore.denoise(frames, radius, prof, temporal_radius=radius, quality=quality)
+    gpu = sdcore.denoise(frames, radius, prof, temporal_radius=radius, quality=quality, use_gpu=True)
+    assert not np.array_equal(cpu, gpu)
+    np.testing.assert_allclose(gpu, cpu, atol=2e-5)
+    assert abs(synth.psnr(clean[2], gpu) - synth.psnr(clean[2], cpu)) < 0.002
